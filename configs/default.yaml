@@ -1,0 +1,78 @@
+# PENCI Default Configuration
+# ===========================
+
+# Model Configuration
+model:
+  # Encoder settings (from BrainOmni)
+  n_dim: 256                    # Feature dimension
+  n_neuro: 64                   # Number of implicit source locations
+  n_head: 4                     # Number of attention heads
+  dropout: 0.0                  # Dropout rate
+  
+  # SEANet encoder settings
+  seanet:
+    n_filters: 32               # Base number of filters
+    ratios: [8, 4, 2]           # Downsampling ratios (total: 64x)
+    kernel_size: 7              # Convolution kernel size
+    residual_kernel_size: 3     # Residual block kernel size
+    last_kernel_size: 7         # Final layer kernel size
+    dilation_base: 2            # Dilation base
+    causal: false               # Use causal convolutions
+    norm: "weight_norm"         # Normalization type
+    lstm: 2                     # Number of LSTM layers
+    
+  # Dynamics core settings
+  dynamics:
+    type: "transformer"         # "transformer" or "rnn"
+    n_layers: 4                 # Number of transformer layers
+    n_heads: 8                  # Number of attention heads
+    dim_feedforward: 1024       # FFN hidden dimension
+    dropout: 0.1                # Dropout rate
+    
+  # Physics decoder settings
+  physics:
+    use_fixed_leadfield: true   # Use fixed lead field matrix
+    leadfield_path: null        # Path to lead field matrix (if null, use identity)
+
+# Data Configuration
+data:
+  root_dir: "/work/2024/tanzunsheng/PENCIData"
+  datasets:
+    - "HBN_EEG"
+  sample_rate: 256              # Hz
+  window_length: 256            # Samples (1 second at 256Hz)
+  n_channels: 128               # Number of EEG channels
+  time_window: 10               # Seconds per sample
+  stride: 5                     # Seconds stride between samples
+
+# Training Configuration
+training:
+  batch_size: 32
+  num_workers: 4
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_steps: 100000
+  gradient_clip: 1.0
+  
+  # Loss weights
+  loss:
+    reconstruction: 1.0         # Sensor-space reconstruction loss
+    dynamics: 0.1               # Dynamics regularization
+    
+  # Logging
+  log_interval: 100
+  save_interval: 5000
+  eval_interval: 1000
+
+# Hardware Configuration
+hardware:
+  device: "cuda"
+  mixed_precision: true
+  compile: false                # torch.compile (PyTorch 2.0+)
+
+# Paths
+paths:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  output_dir: "outputs"
