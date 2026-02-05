@@ -124,7 +124,7 @@ def test_encoders():
     print("\n[3/3] 测试 PENCIEncoder...")
     encoder = PENCIEncoder(
         n_dim=256,
-        n_neuro=64,
+        n_neuro=72,
         n_head=4,
         dropout=0.0,
         n_filters=32,
@@ -150,7 +150,7 @@ def test_dynamics():
     from penci.models.dynamics import DynamicsCore, DynamicsRNN
     
     batch_size = 2
-    n_neuro = 64
+    n_neuro = 72
     seq_len = 40
     n_dim = 256
     
@@ -248,7 +248,7 @@ def test_full_model():
     print("\n[1/2] 测试 PENCI...")
     model = PENCI(
         n_dim=256,
-        n_neuro=64,
+        n_neuro=72,
         n_head=4,
         dropout=0.1,
         n_filters=32,
@@ -370,7 +370,7 @@ def test_integration():
     print("\n创建模型...")
     model = PENCI(
         n_dim=256,
-        n_neuro=64,
+        n_neuro=72,
         n_head=4,
         dropout=0.0,
         n_filters=32,

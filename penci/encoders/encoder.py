@@ -161,7 +161,7 @@ class PENCIEncoder(nn.Module):
     def __init__(
         self,
         n_dim: int = 256,
-        n_neuro: int = 64,
+        n_neuro: int = 72,
         n_head: int = 4,
         dropout: float = 0.0,
         n_filters: int = 32,

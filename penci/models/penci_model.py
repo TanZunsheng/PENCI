@@ -67,7 +67,7 @@ class PENCI(nn.Module):
         self,
         # 通用参数
         n_dim: int = 256,
-        n_neuro: int = 64,
+        n_neuro: int = 72,
         n_head: int = 4,
         dropout: float = 0.1,
         # 编码器参数
@@ -82,7 +82,7 @@ class PENCI(nn.Module):
         dynamics_heads: int = 8,
         dynamics_ff_dim: int = 1024,
         # 解码器参数
-        use_fixed_leadfield: bool = False,
+        use_fixed_leadfield: bool = True,
         leadfield_path: str = None,
         n_sensors: int = 128,
     ):
@@ -365,7 +365,7 @@ def build_penci_from_config(config: Any) -> PENCI:
     
     # 提取参数
     n_dim = model_cfg.get("n_dim", 256)
-    n_neuro = model_cfg.get("n_neuro", 64)
+    n_neuro = model_cfg.get("n_neuro", 72)
     n_head = model_cfg.get("n_head", 4)
     dropout = model_cfg.get("dropout", 0.1)
     
@@ -385,7 +385,7 @@ def build_penci_from_config(config: Any) -> PENCI:
     
     # 物理解码器参数
     physics_cfg = model_cfg.get("physics", {})
-    use_fixed_leadfield = physics_cfg.get("use_fixed_leadfield", False)
+    use_fixed_leadfield = physics_cfg.get("use_fixed_leadfield", True)
     leadfield_path = physics_cfg.get("leadfield_path", None)
     
     # 数据参数

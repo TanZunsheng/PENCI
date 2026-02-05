@@ -1,78 +1,78 @@
-# PENCI Default Configuration
-# ===========================
+# PENCI 默认配置
+# ================
 
-# Model Configuration
+# 模型配置
 model:
-  # Encoder settings (from BrainOmni)
-  n_dim: 256                    # Feature dimension
-  n_neuro: 64                   # Number of implicit source locations
-  n_head: 4                     # Number of attention heads
-  dropout: 0.0                  # Dropout rate
+  # 编码器设置 (源自 BrainOmni)
+  n_dim: 256                    # 特征维度
+  n_neuro: 72                   # 源空间脑区数量 (映射到72个脑区)
+  n_head: 4                     # 注意力头数量
+  dropout: 0.0                  # Dropout 比率
   
-  # SEANet encoder settings
+  # SEANet 编码器设置
   seanet:
-    n_filters: 32               # Base number of filters
-    ratios: [8, 4, 2]           # Downsampling ratios (total: 64x)
-    kernel_size: 7              # Convolution kernel size
-    residual_kernel_size: 3     # Residual block kernel size
-    last_kernel_size: 7         # Final layer kernel size
-    dilation_base: 2            # Dilation base
-    causal: false               # Use causal convolutions
-    norm: "weight_norm"         # Normalization type
-    lstm: 2                     # Number of LSTM layers
+    n_filters: 32               # 基础滤波器数量
+    ratios: [8, 4, 2]           # 下采样比率 (总计: 64倍)
+    kernel_size: 7              # 卷积核大小
+    residual_kernel_size: 3     # 残差块卷积核大小
+    last_kernel_size: 7         # 最后一层卷积核大小
+    dilation_base: 2            # 膨胀卷积基数
+    causal: false               # 是否使用因果卷积
+    norm: "weight_norm"         # 归一化类型
+    lstm: 2                     # LSTM 层数
     
-  # Dynamics core settings
+  # 动力学核心设置
   dynamics:
-    type: "transformer"         # "transformer" or "rnn"
-    n_layers: 4                 # Number of transformer layers
-    n_heads: 8                  # Number of attention heads
-    dim_feedforward: 1024       # FFN hidden dimension
-    dropout: 0.1                # Dropout rate
+    type: "transformer"         # 类型: "transformer" 或 "rnn"
+    n_layers: 4                 # Transformer 层数
+    n_heads: 8                  # 注意力头数量
+    dim_feedforward: 1024       # 前馈网络隐藏层维度
+    dropout: 0.1                # Dropout 比率
     
-  # Physics decoder settings
+  # 物理解码器设置
   physics:
-    use_fixed_leadfield: true   # Use fixed lead field matrix
-    leadfield_path: null        # Path to lead field matrix (if null, use identity)
+    use_fixed_leadfield: true   # 使用固定物理导联场矩阵 (不通过注意力学习)
+    leadfield_path: null        # 导联场矩阵路径 (若为 null 则使用单位矩阵)
 
-# Data Configuration
+# 数据配置
 data:
-  root_dir: "/work/2024/tanzunsheng/PENCIData"
+  root_dir: "/work/2024/tanzunsheng/PENCIData"  # 数据根目录
   datasets:
-    - "HBN_EEG"
-  sample_rate: 256              # Hz
-  window_length: 256            # Samples (1 second at 256Hz)
-  n_channels: 128               # Number of EEG channels
-  time_window: 10               # Seconds per sample
-  stride: 5                     # Seconds stride between samples
+    - "HBN_EEG"                 # 使用的数据集列表
+  sample_rate: 256              # 采样率 (Hz)
+  window_length: 256            # 窗口长度 (采样点数, 256Hz下为1秒)
+  n_channels: 128               # EEG 通道数量
+  time_window: 10               # 每个样本的时间窗口 (秒)
+  stride: 5                     # 样本间滑动步长 (秒)
 
-# Training Configuration
+# 训练配置
 training:
-  batch_size: 32
-  num_workers: 4
-  learning_rate: 1.0e-4
-  weight_decay: 0.01
-  warmup_steps: 1000
-  max_steps: 100000
-  gradient_clip: 1.0
+  batch_size: 32                # 批次大小
+  num_workers: 4                # 数据加载线程数
+  learning_rate: 1.0e-4         # 学习率
+  weight_decay: 0.01            # 权重衰减
+  warmup_steps: 1000            # 学习率预热步数
+  max_steps: 100000             # 最大训练步数
+  gradient_clip: 1.0            # 梯度裁剪阈值
   
-  # Loss weights
+  # 损失函数权重
   loss:
-    reconstruction: 1.0         # Sensor-space reconstruction loss
-    dynamics: 0.1               # Dynamics regularization
+    reconstruction: 1.0         # 传感器空间重建损失权重
+    dynamics: 0.1               # 动力学正则化损失权重
     
-  # Logging
-  log_interval: 100
-  save_interval: 5000
-  eval_interval: 1000
+  # 日志设置
+  log_interval: 100             # 日志记录间隔 (步)
+  save_interval: 5000           # 模型保存间隔 (步)
+  eval_interval: 1000           # 评估间隔 (步)
 
-# Hardware Configuration
+# 硬件配置
 hardware:
-  device: "cuda"
-  mixed_precision: true
-  compile: false                # torch.compile (PyTorch 2.0+)
+  device: "cuda"                # 设备类型: "cuda" 或 "cpu"
+  mixed_precision: true         # 是否使用混合精度训练
+  compile: false                # 是否使用 torch.compile (PyTorch 2.0+)
 
-# Paths
+# 路径配置
 paths:
-  checkpoint_dir: "checkpoints"
-  log_dir: "logs"
-  output_dir: "outputs"
+  checkpoint_dir: "checkpoints" # 模型检查点保存目录
+  log_dir: "logs"               # 日志保存目录
+  output_dir: "outputs"         # 输出结果保存目录
