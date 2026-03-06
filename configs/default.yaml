@@ -32,7 +32,7 @@ model:
   # 物理解码器设置
   physics:
     use_fixed_leadfield: true   # 使用固定物理导联场矩阵 (不通过注意力学习)
-    leadfield_path: null        # 导联场矩阵路径 (若为 null 则使用单位矩阵)
+    leadfield_path: null        # 导联场矩阵路径 (null 表示动态模式，forward 时传入)
 
 # 数据配置
 data:
@@ -44,6 +44,13 @@ data:
   n_channels: 128               # EEG 通道数量
   time_window: 10               # 每个样本的时间窗口 (秒)
   stride: 5                     # 样本间滑动步长 (秒)
+  use_bucket_sampler: true      # 使用 BucketBatchSampler (按通道数分桶，动态导联场必须开启)
+
+# 物理约束配置
+physics:
+  subjects_dir: "/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data"  # fsaverage 数据目录
+  leadfield_cache_dir: "/work/2024/tanzunsheng/leadfield_cache"       # 导联场缓存目录
+  processed_data_dir: "/work/2024/tanzunsheng/ProcessedData"          # BIDS 格式数据目录 (含 electrodes.tsv)
 
 # 训练配置
 training:
