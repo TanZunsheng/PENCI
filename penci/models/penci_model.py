@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from typing import Dict, Optional, Tuple, Any
+from typing import Any, Dict, Optional, Tuple
 
 from penci.encoders.encoder import PENCIEncoder, BrainTokenizerEncoder
 from penci.encoders.sensor_embed import BrainSensorModule
@@ -145,6 +145,7 @@ class PENCI(nn.Module):
         x: torch.Tensor,
         pos: torch.Tensor,
         sensor_type: torch.Tensor,
+        leadfield: Optional[torch.Tensor] = None,
         return_source: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -152,6 +153,10 @@ class PENCI(nn.Module):
             x: 原始 EEG/MEG 信号 (B, C, T) 或 (C, T)
             pos: 电极位置 (B, C, 6) 或 (C, 6)
             sensor_type: 传感器类型 (B, C) 或 (C,)
+            leadfield: 导联场矩阵，支持两种形状:
+                       - (N_sensors, N_sources): 全 batch 共享
+                       - (B, N_sensors, N_sources): per-sample 导联场
+                       仅导联场模式需要（如果解码器未加载静态导联场）
             return_source: 是否返回源空间活动
             
         返回:
@@ -183,8 +188,10 @@ class PENCI(nn.Module):
         sensor_embedding = self.sensor_module(pos, sensor_type)  # (B, C, D)
         
         # 4. 物理解码：源空间 -> 传感器空间
-        # 重排列为解码器期望的格式: (B, N_neuro, T_total, D)
-        reconstruction = self.decoder(source_evolved, sensor_embedding)
+        # 传递导联场到解码器（动态导联场模式）
+        reconstruction = self.decoder(
+            source_evolved, sensor_embedding, leadfield=leadfield
+        )
         
         output = {"reconstruction": reconstruction}
         
@@ -199,6 +206,7 @@ class PENCI(nn.Module):
         x: torch.Tensor,
         pos: torch.Tensor,
         sensor_type: torch.Tensor,
+        leadfield: Optional[torch.Tensor] = None,
         target: torch.Tensor = None,
         loss_weights: Dict[str, float] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -209,6 +217,10 @@ class PENCI(nn.Module):
             x: 输入信号 (B, C, T)
             pos: 电极位置 (B, C, 6)
             sensor_type: 传感器类型 (B, C)
+            leadfield: 导联场矩阵，支持两种形状:
+                       - (N_sensors, N_sources): 全 batch 共享
+                       - (B, N_sensors, N_sources): per-sample 导联场
+                       仅导联场模式需要（如果解码器未加载静态导联场）
             target: 目标信号 (B, C, T')，如果为 None 则使用输入作为目标
             loss_weights: 损失权重字典
             
@@ -218,8 +230,8 @@ class PENCI(nn.Module):
         if loss_weights is None:
             loss_weights = {"reconstruction": 1.0, "dynamics": 0.1}
         
-        # 前向传播
-        output = self.forward(x, pos, sensor_type, return_source=True)
+        # 前向传播（传递导联场到 forward）
+        output = self.forward(x, pos, sensor_type, leadfield=leadfield, return_source=True)
         reconstruction = output["reconstruction"]
         source_activity = output["source_activity"]
         
@@ -327,8 +339,20 @@ class PENCILite(nn.Module):
         x: torch.Tensor,
         pos: torch.Tensor,
         sensor_type: torch.Tensor,
+        leadfield: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """简化的前向传播"""
+        """
+        简化的前向传播
+        
+        参数:
+            x: 原始 EEG/MEG 信号 (B, C, T) 或 (C, T)
+            pos: 电极位置 (B, C, 6) 或 (C, 6)
+            sensor_type: 传感器类型 (B, C) 或 (C,)
+            leadfield: 导联场矩阵，支持两种形状:
+                       - (N_sensors, N_sources): 全 batch 共享
+                       - (B, N_sensors, N_sources): per-sample 导联场
+                       仅导联场模式需要（如果解码器未加载静态导联场）
+        """
         if x.dim() == 2:
             x = x.unsqueeze(0)
             pos = pos.unsqueeze(0)
@@ -342,8 +366,13 @@ class PENCILite(nn.Module):
         # 动力学
         source_evolved = self.dynamics(source_flat)
         
-        # 解码
-        reconstruction = self.decoder(source_evolved)
+        # 传感器嵌入
+        sensor_embedding = self.sensor_module(pos, sensor_type)  # (B, C, D)
+        
+        # 解码（传递导联场到解码器）
+        reconstruction = self.decoder(
+            source_evolved, sensor_embedding, leadfield=leadfield
+        )
         
         return {"reconstruction": reconstruction}
 
