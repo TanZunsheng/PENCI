@@ -121,14 +121,14 @@ docs/
 
 | 文件 | URL | MD5 | 解压到 |
 |------|-----|-----|--------|
-| root.zip | `https://osf.io/3bxqt/download?version=2` | `5133fe92b7b8f03ae19219d5f46e4177` | `/home/2024/tanzunsheng/mne_data/MNE-fsaverage-data/` |
-| bem.zip | `https://osf.io/7ve8g/download?version=4` | `b31509cdcf7908af6a83dc5ee8f49fb1` | `/home/2024/tanzunsheng/mne_data/MNE-fsaverage-data/fsaverage/` |
+| root.zip | `https://osf.io/3bxqt/download?version=2` | `5133fe92b7b8f03ae19219d5f46e4177` | `/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data/` |
+| bem.zip | `https://osf.io/7ve8g/download?version=4` | `b31509cdcf7908af6a83dc5ee8f49fb1` | `/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data/fsaverage/` |
 
 **MNE 配置**：
 
 - MNE 版本：1.8.0
-- SUBJECTS_DIR：`/home/2024/tanzunsheng/mne_data/MNE-fsaverage-data`
-- fsaverage 目录存在但为空：`/home/2024/tanzunsheng/mne_data/MNE-fsaverage-data/fsaverage/`
+- SUBJECTS_DIR：`/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data`
+- fsaverage 目录：`/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data/fsaverage/`（✅ 已完整解压，BEM 文件就绪）
 - 需要的关键 BEM 文件：`fsaverage-5120-5120-5120-bem-sol.fif`、`fsaverage-ico-5-src.fif`、`fsaverage-trans.fif`
 
 ### 3.5 动态导联场计划文档（已写入）
@@ -214,7 +214,7 @@ def forward(self, x, pos, sensor_type, return_source=False):
 | 数据路径 | `/work/2024/tanzunsheng/PENCIData` |
 | GitHub | `https://github.com/TanZunsheng/PENCI` |
 | MNE 版本 | 1.8.0 |
-| SUBJECTS_DIR | `/home/2024/tanzunsheng/mne_data/MNE-fsaverage-data` |
+| SUBJECTS_DIR | `/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data` |
 
 ### 6.2 外部引用
 

@@ -65,8 +65,8 @@
 
 | 文件 | 下载地址 | 放置位置 |
 |------|---------|---------|
-| root.zip (179个文件) | https://osf.io/3bxqt/download?version=2 | 解压到 `/home/2024/tanzunsheng/mne_data/MNE-fsaverage-data/` |
-| bem.zip (12个文件) | https://osf.io/7ve8g/download?version=4 | 解压到 `/home/2024/tanzunsheng/mne_data/MNE-fsaverage-data/fsaverage/` |
+| root.zip (179个文件) | https://osf.io/3bxqt/download?version=2 | 解压到 `/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data/` |
+| bem.zip (12个文件) | https://osf.io/7ve8g/download?version=4 | 解压到 `/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data/fsaverage/` |
 
 **计算导联场必须的关键文件（均在 bem.zip 中）：**
 - `fsaverage-5120-5120-5120-bem-sol.fif` — BEM 解
@@ -245,7 +245,7 @@ physics:
   # leadfield_path: null          ← 删除，改用动态管理
   leadfield_cache_dir: "~/.cache/penci/leadfields"
   n_sources: 72
-  subjects_dir: "/home/2024/tanzunsheng/mne_data/MNE-fsaverage-data"
+  subjects_dir: "/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data"
 ```
 
 **文件：`tests/test_smoke.py`**

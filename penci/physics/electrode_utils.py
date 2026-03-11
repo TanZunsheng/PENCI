@@ -18,10 +18,12 @@
 """
 
 import logging
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -87,11 +89,28 @@ def find_electrodes_tsv(
         ]
     else:
         # 通用路径模式（Brennan_Hale2019, THINGS-EEG, Grootswagers2019, SEED-DV, ThingsEEG 无 session）
-        candidates = [
+        # 候选1：扁平布局 ProcessedData/{dataset_name}/bids/...
+        tsv_name = f"{sub_prefix}_space-CapTrak_electrodes.tsv"
+        flat_path = (
             root / dataset_name / "bids" / "derivatives" / "preprocessing"
-            / sub_prefix / "eeg"
-            / f"{sub_prefix}_space-CapTrak_electrodes.tsv"
-        ]
+            / sub_prefix / "eeg" / tsv_name
+        )
+        candidates = [flat_path]
+
+        # 候选2：嵌套子数据集布局 ProcessedData/{parent}/{dataset_name}/bids/...
+        # 例如 Broderick2018_CocktailParty → ProcessedData/Broderick2018/Broderick2018_CocktailParty/bids/...
+        # 在 ProcessedData/ 下查找 */{dataset_name}/bids/ 模式
+        if not flat_path.exists():
+            for parent_dir in sorted(root.iterdir()):
+                if not parent_dir.is_dir():
+                    continue
+                nested_path = (
+                    parent_dir / dataset_name / "bids" / "derivatives"
+                    / "preprocessing" / sub_prefix / "eeg" / tsv_name
+                )
+                if nested_path.exists():
+                    candidates.append(nested_path)
+                    break  # 找到即停
 
     # 查找存在的候选路径
     for candidate in candidates:
@@ -424,21 +443,28 @@ def _find_reference_subject(
 
 class ElectrodeConfigRegistry:
     """
-    电极配置注册表
+    电极配置注册表（支持电极指纹）
 
-    为每个 (dataset, n_channels) 组合维护一份典型电极配置（通道名 + 米制坐标）。
-    利用的关键事实：同一数据集中使用相同 EEG 帽的所有被试共享相同的通道名称集，
-    因此只需读取一个参考被试的 electrodes.tsv 即可代表整个数据集。
+    为每个 (dataset, n_channels) 组合维护一份典型电极配置（通道名 + 米制坐标），
+    同时建立「电极指纹」索引，支持按指纹直接查询电极配置。
+
+    电极指纹系统:
+        - 每个电极配置有两种指纹:
+          1. full_fingerprint: 基于通道名 + 坐标的完整 hash（由 _compute_channel_hash 计算）
+          2. pos_fingerprint: 仅基于坐标的 hash（由 compute_fingerprint_from_pos 计算）
+        - .pt 文件不含通道名，只能计算 pos_fingerprint
+        - 注册时同时计算两种指纹，建立 pos_fingerprint -> full_fingerprint 的映射
+        - 训练时通过 pos_fingerprint 查找完整电极配置
 
     使用方式:
         1. 初始化时传入 processed_data_dir
-        2. 调用 register_dataset() 注册数据集（自动扫描参考被试）
-        3. 训练循环中调用 get_config() 根据 batch 的 dataset_name 获取电极配置
+        2. 调用 register_dataset() 注册数据集（自动扫描参考被试，建立指纹映射）
+        3. 训练循环中调用 get_config_by_fingerprint(pos_fp) 获取电极配置
 
     配合 LeadfieldManager 使用:
         registry = ElectrodeConfigRegistry(processed_data_dir)
         registry.register_dataset("HBN_EEG")
-        names, positions = registry.get_config("HBN_EEG", 128)
+        names, positions = registry.get_config_by_fingerprint(pos_fingerprint)
         leadfield = leadfield_manager.get_leadfield(names, positions, device)
     """
 
@@ -448,14 +474,19 @@ class ElectrodeConfigRegistry:
             processed_data_dir: ProcessedData 根目录（含 BIDS 格式数据 + electrodes.tsv）
         """
         self._processed_data_dir = processed_data_dir
-        # 缓存: (dataset_name, n_channels) -> (channel_names, channel_positions)
+        # 旧索引（向后兼容）: (dataset_name, n_channels) -> (channel_names, channel_positions)
         self._configs: Dict[Tuple[str, int], Tuple[List[str], np.ndarray]] = {}
+        # 指纹索引: pos_fingerprint -> (channel_names, channel_positions)
+        self._fingerprint_configs: Dict[str, Tuple[List[str], np.ndarray]] = {}
+        # 映射: pos_fingerprint -> full_fingerprint（用于 LeadfieldManager 缓存键一致性）
+        self._pos_to_full_fingerprint: Dict[str, str] = {}
 
     def register_dataset(self, dataset_name: str) -> None:
         """
         注册一个数据集的电极配置
 
         自动查找参考被试，读取 electrodes.tsv 并缓存。
+        同时计算 pos_fingerprint 和 full_fingerprint，建立映射。
 
         参数:
             dataset_name: 数据集名称（如 "HBN_EEG", "SEED-DV"）
@@ -463,6 +494,11 @@ class ElectrodeConfigRegistry:
         异常:
             FileNotFoundError: 找不到参考被试或 electrodes.tsv
         """
+        from penci.physics.leadfield_manager import (
+            _compute_channel_hash,
+            compute_fingerprint_from_pos,
+        )
+
         # 查找参考被试
         subject_id, session, site = _find_reference_subject(
             self._processed_data_dir, dataset_name
@@ -486,12 +522,57 @@ class ElectrodeConfigRegistry:
         )
         n_channels = len(channel_names)
 
-        # 注册
+        # 旧索引注册（向后兼容）
         self._configs[(dataset_name, n_channels)] = (channel_names, channel_positions)
+
+        # 计算指纹并注册
+        full_fp = _compute_channel_hash(channel_names, channel_positions)
+        pos_fp = compute_fingerprint_from_pos(channel_positions)
+
+        self._fingerprint_configs[pos_fp] = (channel_names, channel_positions)
+        self._pos_to_full_fingerprint[pos_fp] = full_fp
+
         logger.info(
             f"注册电极配置: ({dataset_name}, {n_channels}ch) "
-            f"-> {n_channels} 通道"
+            f"pos_fp={pos_fp}, full_fp={full_fp}"
         )
+
+    def register_config(
+        self,
+        channel_names: List[str],
+        channel_positions: np.ndarray,
+        dataset_name: Optional[str] = None,
+    ) -> str:
+        """
+        直接注册一份电极配置（不从文件读取）
+
+        参数:
+            channel_names: 通道名列表
+            channel_positions: (n_channels, 3) 米制坐标数组
+            dataset_name: 可选的数据集名称（用于旧索引）
+
+        返回:
+            pos_fingerprint: 位置指纹字符串
+        """
+        from penci.physics.leadfield_manager import (
+            _compute_channel_hash,
+            compute_fingerprint_from_pos,
+        )
+
+        n_channels = len(channel_names)
+        full_fp = _compute_channel_hash(channel_names, channel_positions)
+        pos_fp = compute_fingerprint_from_pos(channel_positions)
+
+        self._fingerprint_configs[pos_fp] = (channel_names, channel_positions)
+        self._pos_to_full_fingerprint[pos_fp] = full_fp
+
+        if dataset_name is not None:
+            self._configs[(dataset_name, n_channels)] = (channel_names, channel_positions)
+
+        logger.info(
+            f"注册电极配置: {n_channels}ch, pos_fp={pos_fp}, full_fp={full_fp}"
+        )
+        return pos_fp
 
     def get_config(
         self,
@@ -499,7 +580,7 @@ class ElectrodeConfigRegistry:
         n_channels: int,
     ) -> Tuple[List[str], np.ndarray]:
         """
-        获取指定数据集+通道数的电极配置
+        获取指定数据集+通道数的电极配置（旧接口，向后兼容）
 
         参数:
             dataset_name: 数据集名称
@@ -522,6 +603,38 @@ class ElectrodeConfigRegistry:
             )
         return self._configs[key]
 
+    def get_config_by_fingerprint(
+        self,
+        pos_fingerprint: str,
+    ) -> Tuple[List[str], np.ndarray]:
+        """
+        按位置指纹获取电极配置
+
+        参数:
+            pos_fingerprint: 由 compute_fingerprint_from_pos() 计算的位置指纹
+
+        返回:
+            (channel_names, channel_positions) 元组
+
+        异常:
+            KeyError: 未注册该指纹
+        """
+        if pos_fingerprint not in self._fingerprint_configs:
+            raise KeyError(
+                f"未注册的电极指纹: {pos_fingerprint}\n"
+                f"已注册指纹: {list(self._fingerprint_configs.keys())}\n"
+                f"请确认数据集已通过 register_dataset() 注册"
+            )
+        return self._fingerprint_configs[pos_fingerprint]
+
+    def has_fingerprint(self, pos_fingerprint: str) -> bool:
+        """检查是否已注册指定位置指纹"""
+        return pos_fingerprint in self._fingerprint_configs
+
+    def get_all_fingerprints(self) -> List[str]:
+        """列出所有已注册的位置指纹"""
+        return list(self._fingerprint_configs.keys())
+
     def has_config(self, dataset_name: str, n_channels: int) -> bool:
         """检查是否已注册指定 (dataset, n_channels) 配置"""
         return (dataset_name, n_channels) in self._configs
@@ -534,3 +647,145 @@ class ElectrodeConfigRegistry:
     def registered_configs(self) -> List[Tuple[str, int]]:
         """列出所有已注册的 (dataset, n_channels) 配置"""
         return list(self._configs.keys())
+
+    @property
+    def registered_fingerprints(self) -> Dict[str, str]:
+        """列出所有 pos_fingerprint -> full_fingerprint 映射"""
+        return dict(self._pos_to_full_fingerprint)
+
+    @classmethod
+    def load_from_archive(
+        cls,
+        archive_path: str,
+        processed_data_dir: Optional[str] = None,
+    ) -> "ElectrodeConfigRegistry":
+        """
+        从离线预计算的 archive 文件加载电极配置注册表
+
+        这是推荐的初始化方式（两阶段架构的在线阶段）。
+        archive 由 scripts/precompute_all_leadfields.py 离线生成，
+        包含所有已发现的电极配置及其对应的导联场缓存路径。
+
+        加载后，registry 已包含所有 pos_fingerprint → (channel_names, channel_positions)
+        映射，无需再调用 register_dataset()。
+
+        archive 格式:
+            {
+                "__version__": 1,
+                "__created_at__": "ISO时间戳",
+                "configs": {
+                    pos_fingerprint: {
+                        "channel_names": List[str],
+                        "channel_positions_m": np.ndarray (N, 3),
+                        "full_fingerprint": str,
+                        "leadfield_cache_path": Optional[str],
+                    },
+                    ...
+                }
+            }
+
+        参数:
+            archive_path: archive .pt 文件路径
+            processed_data_dir: ProcessedData 根目录（可选，用于旧接口兼容）
+
+        返回:
+            已填充的 ElectrodeConfigRegistry 实例
+
+        异常:
+            FileNotFoundError: archive 文件不存在
+            RuntimeError: archive 格式不兼容
+        """
+        archive_path = Path(archive_path)
+        if not archive_path.exists():
+            raise FileNotFoundError(
+                f"指纹注册表 archive 文件不存在: {archive_path}\n"
+                f"请先运行 scripts/precompute_all_leadfields.py 生成"
+            )
+
+        logger.info(f"从 archive 加载电极配置注册表: {archive_path}")
+        archive = torch.load(str(archive_path), weights_only=False)
+
+        # 版本检查
+        version = archive.get("__version__", 0)
+        if version != 1:
+            raise RuntimeError(
+                f"archive 版本不兼容: {version}（期望 1）\n"
+                f"请重新运行 scripts/precompute_all_leadfields.py 生成"
+            )
+
+        created_at = archive.get("__created_at__", "未知")
+        configs = archive.get("configs", {})
+
+        # 创建实例
+        instance = cls(processed_data_dir or "")
+
+        for pos_fp, entry in configs.items():
+            channel_names = entry["channel_names"]
+            channel_positions = entry["channel_positions_m"]
+            full_fp = entry["full_fingerprint"]
+
+            # 确保坐标为 np.ndarray float64
+            if isinstance(channel_positions, torch.Tensor):
+                channel_positions = channel_positions.numpy()
+            channel_positions = np.asarray(channel_positions, dtype=np.float64)
+
+            # 注册到指纹索引
+            instance._fingerprint_configs[pos_fp] = (channel_names, channel_positions)
+            instance._pos_to_full_fingerprint[pos_fp] = full_fp
+
+            # 同时注册到旧索引（dataset_name 不可用时用 "archive" 占位）
+            n_channels = len(channel_names)
+            # 不覆盖已有的旧索引键
+            key = ("archive", n_channels)
+            if key not in instance._configs:
+                instance._configs[key] = (channel_names, channel_positions)
+
+        logger.info(
+            f"从 archive 加载了 {len(configs)} 个电极配置"
+            f"（创建于 {created_at}）"
+        )
+        return instance
+
+    def save_to_archive(
+        self,
+        archive_path: str,
+        leadfield_cache_dir: Optional[str] = None,
+    ) -> None:
+        """
+        将当前注册表保存为 archive 文件
+
+        参数:
+            archive_path: 输出 archive .pt 文件路径
+            leadfield_cache_dir: 导联场缓存目录（用于记录缓存路径）
+        """
+        configs = {}
+        for pos_fp, (channel_names, channel_positions) in self._fingerprint_configs.items():
+            full_fp = self._pos_to_full_fingerprint.get(pos_fp, "")
+
+            # 导联场缓存路径
+            leadfield_path = None
+            if leadfield_cache_dir and full_fp:
+                cache_file = Path(leadfield_cache_dir) / f"{full_fp}.pt"
+                if cache_file.exists():
+                    leadfield_path = str(cache_file)
+
+            configs[pos_fp] = {
+                "channel_names": list(channel_names),
+                "channel_positions_m": np.asarray(channel_positions, dtype=np.float64),
+                "full_fingerprint": full_fp,
+                "leadfield_cache_path": leadfield_path,
+            }
+
+        archive = {
+            "__version__": 1,
+            "__created_at__": datetime.now().isoformat(),
+            "configs": configs,
+        }
+
+        archive_path = Path(archive_path)
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(archive, str(archive_path))
+        logger.info(
+            f"电极配置注册表已保存: {archive_path} "
+            f"({len(configs)} 个配置)"
+        )

@@ -42,30 +42,82 @@ logger = logging.getLogger(__name__)
 def _compute_channel_hash(
     channel_names: List[str],
     channel_positions: np.ndarray,
+    precision_mm: float = 0.1,
 ) -> str:
     """
-    计算通道配置的唯一 hash
+    计算通道配置的唯一 hash（电极指纹）
 
-    基于排序后的通道名和坐标，确保相同配置始终产生相同 hash。
+    基于排序后的通道名和量化坐标，确保相同配置始终产生相同 hash。
+    坐标量化到 precision_mm 精度（默认 0.1mm），避免 float32/float64 转换
+    带来的浮点噪声导致缓存失效。
 
     参数:
         channel_names: 通道名列表
         channel_positions: (n_channels, 3) 坐标数组（米制）
+        precision_mm: 坐标量化精度（毫米），默认 0.1mm
 
     返回:
         16 字符的十六进制 hash 字符串
     """
-    # 按通道名排序以确保一致性
-    sorted_indices = np.argsort(channel_names)
-    sorted_names = [channel_names[i] for i in sorted_indices]
-    sorted_positions = channel_positions[sorted_indices]
+    # 按通道名排序以确保一致性（使用 zip + sorted 更明确）
+    sorted_pairs = sorted(
+        zip(channel_names, channel_positions), key=lambda x: x[0]
+    )
+    sorted_names = [p[0] for p in sorted_pairs]
+    sorted_positions = np.array([p[1] for p in sorted_pairs])
 
     # 构建 hash 输入
     hasher = hashlib.sha256()
+
+    # 通道名
     for name in sorted_names:
         hasher.update(name.encode("utf-8"))
-    # 坐标精度到小数点后 8 位（纳米级），避免浮点精度差异
-    hasher.update(np.round(sorted_positions, decimals=8).tobytes())
+
+    # 坐标量化：米制 -> 整数（单位 = precision_mm）
+    # 例如 precision_mm=0.1 时，乘以 10000（1m = 1000mm / 0.1mm = 10000 单位）
+    scale = 1000.0 / precision_mm  # 米 -> 量化单位
+    pos_int = np.round(sorted_positions * scale).astype(np.int32)
+
+    # 包含 shape 和 dtype 信息防止碰撞（如 (64,3) vs (192,1) 同 tobytes）
+    hasher.update(str(pos_int.shape).encode("utf-8"))
+    hasher.update(str(pos_int.dtype).encode("utf-8"))
+    hasher.update(pos_int.tobytes())
+
+    return hasher.hexdigest()[:16]
+
+
+def compute_fingerprint_from_pos(
+    positions: np.ndarray,
+    precision_mm: float = 0.1,
+) -> str:
+    """
+    仅从坐标数组计算电极指纹（不含通道名）
+
+    用于从 .pt 样本的 pos 张量计算指纹，以便在数据集层面做分桶。
+    .pt 文件中不包含通道名，仅有 pos: (C, 6) 张量。
+
+    计算方式与 _compute_channel_hash 的坐标部分一致：
+    按行排序 -> 量化 -> SHA-256 前 16 位。
+
+    参数:
+        positions: (n_channels, 3) xyz 坐标数组（米制）
+        precision_mm: 坐标量化精度（毫米），默认 0.1mm
+
+    返回:
+        16 字符的十六进制 hash 字符串
+    """
+    # 按行排序（先 x，再 y，再 z）确保顺序无关
+    sorted_idx = np.lexsort((positions[:, 2], positions[:, 1], positions[:, 0]))
+    sorted_positions = positions[sorted_idx]
+
+    # 量化
+    scale = 1000.0 / precision_mm
+    pos_int = np.round(sorted_positions * scale).astype(np.int32)
+
+    hasher = hashlib.sha256()
+    hasher.update(str(pos_int.shape).encode("utf-8"))
+    hasher.update(str(pos_int.dtype).encode("utf-8"))
+    hasher.update(pos_int.tobytes())
 
     return hasher.hexdigest()[:16]
 

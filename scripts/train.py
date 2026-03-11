@@ -62,21 +62,19 @@ def save_checkpoint(
 
 
 def resolve_leadfield_for_batch(
-    batch_metadata: List[Dict],
-    n_channels: int,
+    fingerprint: str,
     leadfield_manager: LeadfieldManager,
     electrode_registry: ElectrodeConfigRegistry,
     device: torch.device,
 ) -> torch.Tensor:
     """
-    根据 batch 元数据解析对应的导联场矩阵
+    根据电极指纹解析对应的导联场矩阵
 
-    BucketBatchSampler 保证同一 batch 内所有样本通道数相同，
-    因此只需计算一次导联场并扩展到 batch 维度。
+    BucketBatchSampler 按 (通道数, 电极指纹) 分桶，保证同一 batch 内
+    所有样本的电极配置完全一致，因此只需计算一次导联场。
 
     参数:
-        batch_metadata: batch 中每个样本的元数据列表
-        n_channels: 当前 batch 的通道数
+        fingerprint: 当前 batch 的电极位置指纹（pos_fingerprint）
         leadfield_manager: 导联场管理器
         electrode_registry: 电极配置注册表
         device: 计算设备
@@ -84,9 +82,8 @@ def resolve_leadfield_for_batch(
     返回:
         (n_channels, 72) 导联场张量
     """
-    dataset_name = batch_metadata[0]["dataset"]
-    channel_names, channel_positions = electrode_registry.get_config(
-        dataset_name, n_channels
+    channel_names, channel_positions = electrode_registry.get_config_by_fingerprint(
+        fingerprint
     )
     return leadfield_manager.get_leadfield(channel_names, channel_positions, device)
 
@@ -121,11 +118,11 @@ def setup_physics(config: dict) -> Tuple[
     subjects_dir = global_physics.get("subjects_dir")
     cache_dir = global_physics.get("leadfield_cache_dir")
     processed_data_dir = global_physics.get("processed_data_dir")
+    registry_path = global_physics.get("fingerprint_registry_path")
 
-    if not all([subjects_dir, cache_dir, processed_data_dir]):
+    if not subjects_dir or not cache_dir:
         raise RuntimeError(
-            "动态导联场模式需要 physics.subjects_dir、"
-            "physics.leadfield_cache_dir 和 physics.processed_data_dir 配置"
+            "动态导联场模式需要 physics.subjects_dir 和 physics.leadfield_cache_dir 配置"
         )
 
     logger.info("初始化物理约束组件...")
@@ -139,18 +136,31 @@ def setup_physics(config: dict) -> Tuple[
         cache_dir=cache_dir,
     )
 
-    electrode_registry = ElectrodeConfigRegistry(processed_data_dir)
+    if registry_path is not None:
+        logger.info(f"从离线存档加载电极配置注册表: {registry_path}")
+        electrode_registry = ElectrodeConfigRegistry.load_from_archive(registry_path)
+        logger.info(
+            f"  已加载 {len(electrode_registry.get_all_fingerprints())} 个唯一电极指纹"
+        )
+    else:
+        if not processed_data_dir:
+            raise RuntimeError(
+                "运行时扫描模式需要 physics.processed_data_dir 配置，"
+                "或设置 physics.fingerprint_registry_path 使用离线存档"
+            )
+        logger.info("未配置 fingerprint_registry_path，使用运行时扫描模式")
+        electrode_registry = ElectrodeConfigRegistry(processed_data_dir)
 
-    datasets = config.get("data", {}).get("datasets", [])
-    for ds_name in datasets:
-        try:
-            electrode_registry.register_dataset(ds_name)
-        except FileNotFoundError as e:
-            logger.warning(f"注册数据集 '{ds_name}' 电极配置失败: {e}")
+        datasets = config.get("data", {}).get("datasets", [])
+        for ds_name in datasets:
+            try:
+                electrode_registry.register_dataset(ds_name)
+            except FileNotFoundError as e:
+                logger.warning(f"注册数据集 '{ds_name}' 电极配置失败: {e}")
 
-    logger.info(
-        f"  已注册电极配置: {electrode_registry.registered_configs}"
-    )
+        logger.info(
+            f"  已注册电极配置: {electrode_registry.registered_configs}"
+        )
 
     return source_space, leadfield_manager, electrode_registry
 
@@ -185,9 +195,9 @@ def train_one_epoch(
 
         leadfield = None
         if leadfield_manager is not None and electrode_registry is not None:
-            n_channels = batch["n_channels"][0].item()
+            fingerprint = batch.get("fingerprint", "unknown")
             leadfield = resolve_leadfield_for_batch(
-                batch["metadata"], n_channels,
+                fingerprint,
                 leadfield_manager, electrode_registry, device,
             )
 
@@ -257,9 +267,9 @@ def evaluate(
 
         leadfield = None
         if leadfield_manager is not None and electrode_registry is not None:
-            n_channels = batch["n_channels"][0].item()
+            fingerprint = batch.get("fingerprint", "unknown")
             leadfield = resolve_leadfield_for_batch(
-                batch["metadata"], n_channels,
+                fingerprint,
                 leadfield_manager, electrode_registry, device,
             )
 
@@ -327,12 +337,16 @@ def main():
     training_config = config.get("training", {})
 
     use_bucket_sampler = data_config.get("use_bucket_sampler", False)
+    use_fingerprint = False
     if leadfield_manager is not None and not use_bucket_sampler:
         logger.warning(
             "动态导联场模式下建议使用 BucketBatchSampler "
             "(data.use_bucket_sampler: true)，自动启用"
         )
         use_bucket_sampler = True
+    if leadfield_manager is not None:
+        use_fingerprint = True
+        logger.info("动态导联场模式: 自动启用电极指纹分桶")
 
     configured_datasets = data_config.get("datasets", ["HBN_EEG"])
 
@@ -342,6 +356,7 @@ def main():
         batch_size=training_config.get("batch_size", 32),
         num_workers=training_config.get("num_workers", 4),
         use_bucket_sampler=use_bucket_sampler,
+        use_fingerprint=use_fingerprint,
         max_length=data_config.get("time_window", 10) * data_config.get("sample_rate", 256),
         target_channels=data_config.get("n_channels", 128) if not use_bucket_sampler else None,
         datasets=configured_datasets,
@@ -350,6 +365,8 @@ def main():
     logger.info(f"训练集大小: {len(train_loader.dataset)}")
     logger.info(f"验证集大小: {len(val_loader.dataset)}")
     logger.info(f"BucketBatchSampler: {'启用' if use_bucket_sampler else '禁用'}")
+    if use_fingerprint:
+        logger.info("电极指纹分桶: 启用")
 
     # 自动注册数据加载器中实际出现的所有数据集的电极配置
     if electrode_registry is not None:
@@ -366,6 +383,24 @@ def main():
         logger.info(
             f"  最终电极配置: {electrode_registry.registered_configs}"
         )
+        logger.info(
+            f"  已注册指纹: {electrode_registry.get_all_fingerprints()}"
+        )
+
+    # === 导联场预热 ===
+    # 预计算所有已注册指纹对应的导联场，避免训练循环中首次命中时卡顿
+    if leadfield_manager is not None and electrode_registry is not None:
+        all_fps = electrode_registry.get_all_fingerprints()
+        if all_fps:
+            logger.info(f"预热导联场: {len(all_fps)} 个唯一电极配置...")
+            for fp in all_fps:
+                try:
+                    names, positions = electrode_registry.get_config_by_fingerprint(fp)
+                    L = leadfield_manager.get_leadfield(names, positions, device)
+                    logger.info(f"  指纹 {fp}: 导联场 {L.shape}")
+                except Exception as e:
+                    logger.warning(f"  指纹 {fp} 导联场预热失败: {e}")
+            logger.info("导联场预热完成")
 
     # === 优化器 ===
     optimizer = optim.AdamW(

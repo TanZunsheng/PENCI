@@ -502,6 +502,124 @@ def test_electrode_utils():
     return True
 
 
+def test_fingerprint_system():
+    """
+    测试电极指纹系统
+
+    验证 compute_fingerprint_from_pos、ElectrodeConfigRegistry 指纹功能
+    以及 BucketBatchSampler 的指纹分桶逻辑。不依赖外部数据（fsaverage 等）。
+    """
+    print("\n" + "=" * 60)
+    print("测试电极指纹系统")
+    print("=" * 60)
+
+    import numpy as np
+    from penci.physics.leadfield_manager import (
+        _compute_channel_hash,
+        compute_fingerprint_from_pos,
+    )
+    from penci.physics.electrode_utils import ElectrodeConfigRegistry
+
+    # === 1. 测试 compute_fingerprint_from_pos 基本功能 ===
+    print("\n[1/7] 测试 compute_fingerprint_from_pos 基本功能...")
+    pos_a = np.array([[0.02, 0.08, 0.01], [-0.02, 0.08, 0.01], [0.0, 0.0, 0.0948]])
+    fp_a = compute_fingerprint_from_pos(pos_a)
+    assert isinstance(fp_a, str), f"指纹类型错误: {type(fp_a)}"
+    assert len(fp_a) == 16, f"指纹长度错误: {len(fp_a)}（应为 16）"
+    print(f"  ✓ 指纹: {fp_a}（长度 {len(fp_a)}）")
+
+    # === 2. 测试相同坐标产生相同指纹 ===
+    print("\n[2/7] 测试确定性（相同坐标 → 相同指纹）...")
+    fp_a2 = compute_fingerprint_from_pos(pos_a.copy())
+    assert fp_a == fp_a2, f"确定性失败: {fp_a} != {fp_a2}"
+    print(f"  ✓ 相同坐标产生相同指纹")
+
+    # === 3. 测试行顺序无关性 ===
+    print("\n[3/7] 测试行顺序无关性...")
+    pos_a_shuffled = pos_a[[2, 0, 1]]  # 行重排
+    fp_a_shuffled = compute_fingerprint_from_pos(pos_a_shuffled)
+    assert fp_a == fp_a_shuffled, (
+        f"行顺序无关性失败: {fp_a} != {fp_a_shuffled}"
+    )
+    print(f"  ✓ 不同行顺序产生相同指纹")
+
+    # === 4. 测试不同坐标产生不同指纹 ===
+    print("\n[4/7] 测试不同坐标 → 不同指纹...")
+    pos_b = np.array([[0.03, 0.07, 0.02], [-0.03, 0.07, 0.02], [0.0, 0.0, 0.09]])
+    fp_b = compute_fingerprint_from_pos(pos_b)
+    assert fp_a != fp_b, f"不同坐标应产生不同指纹: {fp_a} == {fp_b}"
+    print(f"  ✓ 不同坐标: {fp_a} vs {fp_b}")
+
+    # === 5. 测试 float32/float64 精度一致性 ===
+    print("\n[5/7] 测试 float32/float64 一致性...")
+    pos_f32 = pos_a.astype(np.float32)
+    pos_f64 = pos_a.astype(np.float64)
+    fp_f32 = compute_fingerprint_from_pos(pos_f32)
+    fp_f64 = compute_fingerprint_from_pos(pos_f64)
+    assert fp_f32 == fp_f64, (
+        f"精度不一致: float32={fp_f32} vs float64={fp_f64}"
+    )
+    print(f"  ✓ float32 与 float64 产生相同指纹")
+
+    # === 6. 测试 _compute_channel_hash ===
+    print("\n[6/7] 测试 _compute_channel_hash...")
+    names_a = ["Fp1", "Fp2", "Cz"]
+    full_fp = _compute_channel_hash(names_a, pos_a)
+    assert isinstance(full_fp, str), f"完整指纹类型错误: {type(full_fp)}"
+    assert len(full_fp) == 16, f"完整指纹长度错误: {len(full_fp)}"
+    # 相同输入相同 hash
+    full_fp2 = _compute_channel_hash(names_a, pos_a.copy())
+    assert full_fp == full_fp2, f"完整指纹确定性失败"
+    # 不同通道名 → 不同 hash（即使坐标相同）
+    names_b = ["Fp1", "Fp2", "Oz"]
+    full_fp_b = _compute_channel_hash(names_b, pos_a)
+    assert full_fp != full_fp_b, f"不同通道名应产生不同 hash"
+    print(f"  ✓ 完整指纹: {full_fp}，通道名不同 → 指纹不同")
+
+    # === 7. 测试 ElectrodeConfigRegistry 指纹注册与查询 ===
+    print("\n[7/7] 测试 ElectrodeConfigRegistry 指纹功能...")
+    # 使用一个不存在的目录（不调用 register_dataset，只测试 register_config）
+    registry = ElectrodeConfigRegistry("/tmp/nonexistent_processed_data")
+
+    # 注册配置
+    pos_fp = registry.register_config(names_a, pos_a, dataset_name="TestDataset")
+    assert pos_fp == fp_a, f"注册后的 pos_fp 不匹配: {pos_fp} vs {fp_a}"
+
+    # has_fingerprint
+    assert registry.has_fingerprint(pos_fp), "has_fingerprint 返回 False"
+    assert not registry.has_fingerprint("abcdef1234567890"), "虚假指纹不应存在"
+
+    # get_config_by_fingerprint
+    ret_names, ret_pos = registry.get_config_by_fingerprint(pos_fp)
+    assert ret_names == names_a, f"通道名不匹配: {ret_names}"
+    assert np.array_equal(ret_pos, pos_a), f"坐标不匹配"
+
+    # get_all_fingerprints
+    all_fps = registry.get_all_fingerprints()
+    assert pos_fp in all_fps, f"指纹未在列表中"
+
+    # registered_fingerprints
+    fp_map = registry.registered_fingerprints
+    assert pos_fp in fp_map, "pos_fp 不在映射中"
+    assert fp_map[pos_fp] == full_fp, f"映射值不匹配: {fp_map[pos_fp]} vs {full_fp}"
+
+    # 旧接口兼容
+    ret_names2, ret_pos2 = registry.get_config("TestDataset", 3)
+    assert ret_names2 == names_a, "旧接口通道名不匹配"
+
+    # KeyError 测试
+    try:
+        registry.get_config_by_fingerprint("nonexistent_fingerprint")
+        assert False, "应抛出 KeyError"
+    except KeyError:
+        pass
+
+    print(f"  ✓ Registry: 注册/查询/指纹映射全部正确")
+
+    print("\n✓ 电极指纹系统测试通过！")
+    return True
+
+
 def test_source_space():
     """
     测试 SourceSpace (72 个脑区)
@@ -668,6 +786,7 @@ def main():
         ("数据加载", test_data_loading),
         ("集成测试", test_integration),
         ("电极工具", test_electrode_utils),
+        ("电极指纹系统", test_fingerprint_system),
         ("源空间", test_source_space),
         ("导联场端到端", test_leadfield_e2e),
     ]

@@ -405,7 +405,7 @@ info = mne.create_info(ch_names, sfreq=256, ch_types="eeg")
 info.set_montage(montage)
 
 # 3. 加载 fsaverage BEM 和源空间
-subjects_dir = "/home/2024/tanzunsheng/mne_data/MNE-fsaverage-data"
+subjects_dir = "/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data"
 bem = mne.read_bem_solution(f"{subjects_dir}/fsaverage/bem/fsaverage-5120-5120-5120-bem-sol.fif")
 src = mne.read_source_spaces(f"{subjects_dir}/fsaverage/bem/fsaverage-ico-5-src.fif")
 
@@ -560,8 +560,8 @@ sensor_signal = torch.einsum("bcs,bst->bct", L_batch, source_signal)
 
 | 文件 | 下载地址 | 放置位置 |
 |------|---------|---------|
-| root.zip (179个文件) | `https://osf.io/3bxqt/download?version=2` | 解压到 `/home/2024/tanzunsheng/mne_data/MNE-fsaverage-data/` |
-| bem.zip (12个文件) | `https://osf.io/7ve8g/download?version=4` | 解压到 `/home/2024/tanzunsheng/mne_data/MNE-fsaverage-data/fsaverage/` |
+| root.zip (179个文件) | `https://osf.io/3bxqt/download?version=2` | 解压到 `/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data/` |
+| bem.zip (12个文件) | `https://osf.io/7ve8g/download?version=4` | 解压到 `/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data/fsaverage/` |
 
 ### 阶段 1：实现 LeadfieldManager
 
@@ -713,7 +713,7 @@ model:
     leadfield_path: null        # 导联场路径（将被 LeadfieldManager 替代）
     # 以下为待添加配置项：
     # leadfield_cache_dir: "~/.cache/penci/leadfields"
-    # subjects_dir: "/home/2024/tanzunsheng/mne_data/MNE-fsaverage-data"
+    # subjects_dir: "/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data"
     # n_sources: 72
 
 data:

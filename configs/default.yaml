@@ -51,6 +51,10 @@ physics:
   subjects_dir: "/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data"  # fsaverage 数据目录
   leadfield_cache_dir: "/work/2024/tanzunsheng/leadfield_cache"       # 导联场缓存目录
   processed_data_dir: "/work/2024/tanzunsheng/ProcessedData"          # BIDS 格式数据目录 (含 electrodes.tsv)
+  # 离线预计算的指纹注册表存档路径（由 scripts/precompute_all_leadfields.py 生成）
+  # 设置后 setup_physics() 优先从存档加载，跳过运行时扫描 ProcessedData
+  # 设为 null 则沿用旧的运行时扫描模式（向后兼容）
+  fingerprint_registry_path: null                                     # 指纹注册表存档 (.pt)
 
 # 训练配置
 training:
