@@ -919,14 +919,13 @@ def main():
 
     _, val_loader = get_train_val_loaders(
         data_root=data_config.get("root_dir", "/work/2024/tanzunsheng/PENCIData"),
-        dataset_name=configured_datasets[0],
+        datasets=configured_datasets,
         batch_size=training_config.get("batch_size", 32),
         num_workers=training_config.get("num_workers", 4),
         use_bucket_sampler=use_bucket_sampler,
         use_fingerprint=use_fingerprint,
         max_length=data_config.get("time_window", 10) * data_config.get("sample_rate", 256),
         target_channels=data_config.get("n_channels", 128) if not use_bucket_sampler else None,
-        datasets=configured_datasets,
     )
     logger.info(f"评估数据集大小: {len(val_loader.dataset)}")
 
