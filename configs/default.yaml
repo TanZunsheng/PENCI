@@ -37,8 +37,19 @@ model:
 # 数据配置
 data:
   root_dir: "/work/2024/tanzunsheng/PENCIData"  # 数据根目录
-  datasets:
-    - "HBN_EEG"                 # 使用的数据集列表
+  datasets:                     # 使用的数据集列表 (全部 10 个)
+    - "HBN_EEG"
+    - "Brennan_Hale2019"
+    - "Grootswagers2019"
+    - "THINGS-EEG"
+    - "ThingsEEG"
+    - "SEED-DV"
+    - "Broderick2018_NaturalSpeech"
+    - "Broderick2018_NaturalSpeechReverse"
+    - "Broderick2018_SpeechInNoise"
+    - "Broderick2018_CocktailParty"
+  # 注意: Broderick2018 子数据集位于 PENCIData/Broderick2018/ 目录下
+  # 元数据路径会自动在 data_root 下查找 {dataset_name}-metadata/
   sample_rate: 256              # 采样率 (Hz)
   window_length: 256            # 窗口长度 (采样点数, 256Hz下为1秒)
   n_channels: 128               # EEG 通道数量
@@ -54,17 +65,23 @@ physics:
   # 离线预计算的指纹注册表存档路径（由 scripts/precompute_all_leadfields.py 生成）
   # 设置后 setup_physics() 优先从存档加载，跳过运行时扫描 ProcessedData
   # 设为 null 则沿用旧的运行时扫描模式（向后兼容）
-  fingerprint_registry_path: null                                     # 指纹注册表存档 (.pt)
+  fingerprint_registry_path: "/work/2024/tanzunsheng/leadfield_cache/fingerprint_registry.pt"
 
 # 训练配置
 training:
-  batch_size: 32                # 批次大小
-  num_workers: 4                # 数据加载线程数
-  learning_rate: 1.0e-4         # 学习率
+  # --- 单卡基准参数 (DDP 自动缩放，见下方注释) ---
+  batch_size: 32                # 每卡批次大小 (per-GPU batch size)
+  num_workers: 4                # 每卡数据加载线程数
+  learning_rate: 1.0e-4         # 单卡基准学习率
   weight_decay: 0.01            # 权重衰减
-  warmup_steps: 1000            # 学习率预热步数
-  max_steps: 100000             # 最大训练步数
+  warmup_steps: 1000            # 学习率线性预热步数
+  max_steps: 100000             # 最大训练步数 (全局，非 per-GPU)
   gradient_clip: 1.0            # 梯度裁剪阈值
+  # DDP 缩放规则 (由 train.py 自动执行):
+  #   effective_lr = learning_rate * world_size        (线性缩放)
+  #   warmup_steps 保持不变 (已按全局步数定义)
+  #   max_steps 保持不变 (按全局步数计算)
+  #   batch_size 为 per-GPU，全局 batch = batch_size * world_size
   
   # 损失函数权重
   loss:
@@ -76,11 +93,35 @@ training:
   save_interval: 5000           # 模型保存间隔 (步)
   eval_interval: 1000           # 评估间隔 (步)
 
+# 分布式训练配置
+distributed:
+  backend: "nccl"               # 通信后端 (nccl 适用于 GPU)
+  find_unused_parameters: false # DDP 是否查找未使用参数 (PENCI 无需)
+
 # 硬件配置
 hardware:
   device: "cuda"                # 设备类型: "cuda" 或 "cpu"
-  mixed_precision: true         # 是否使用混合精度训练
+  mixed_precision: true         # 是否使用混合精度训练 (AMP)
   compile: false                # 是否使用 torch.compile (PyTorch 2.0+)
+
+# 评估配置
+evaluation:
+  # 传感器空间重建指标 (层级1)
+  sensor_metrics:
+    - "pearson"                 # Pearson 相关系数
+    - "snr_db"                  # 信噪比 (dB)
+    - "nrmse"                   # 归一化均方根误差
+  # 源空间对比 (层级2)
+  source_comparison:
+    method: "sLORETA"           # 传统逆解方法
+    lambda2: 0.1111             # 正则化参数 (1/SNR^2, SNR=3)
+    loose: 0.2                  # 偶极子方向松弛度
+    depth: 0.8                  # 深度加权
+  # 仿真测试 (层级3)
+  simulation:
+    n_trials: 50                # 仿真试验次数
+    n_dipoles: 1                # 每次试验放置的偶极子数量
+    nave: 20                    # 仿真平均次数 (影响信噪比)
 
 # 路径配置
 paths:
