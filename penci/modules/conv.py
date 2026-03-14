@@ -18,7 +18,8 @@ import warnings
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch.nn.utils import spectral_norm, weight_norm
+from torch.nn.utils import spectral_norm
+from torch.nn.utils.parametrizations import weight_norm as parametrization_weight_norm
 import einops
 
 
@@ -56,7 +57,8 @@ def apply_parametrization_norm(module: nn.Module, norm: str = "none") -> nn.Modu
     """应用参数化归一化"""
     assert norm in CONV_NORMALIZATIONS
     if norm == "weight_norm":
-        return weight_norm(module)
+        # 使用新 API，避免 torch.nn.utils.weight_norm 的 FutureWarning。
+        return parametrization_weight_norm(module)
     elif norm == "spectral_norm":
         return spectral_norm(module)
     else:

@@ -17,7 +17,7 @@ import math
 import argparse
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
 import torch
@@ -41,6 +41,33 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def configure_ddp_mode(ddp_mode: str) -> None:
+    """
+    配置 DDP/NCCL 运行模式
+
+    - prod: 清理常见诊断变量，回到安静/性能优先配置
+    - debug: 启用详细分布式诊断日志
+    """
+    debug_vars = [
+        "NCCL_DEBUG",
+        "TORCH_DISTRIBUTED_DEBUG",
+        "TORCH_FR_BUFFER_SIZE",
+        "TORCH_NCCL_TRACE_BUFFER_SIZE",
+        "NCCL_P2P_DISABLE",
+        "NCCL_IB_DISABLE",
+    ]
+
+    if ddp_mode == "prod":
+        for key in debug_vars:
+            os.environ.pop(key, None)
+        return
+
+    # debug 模式默认值；用户若已手动设置则保留其值
+    os.environ.setdefault("NCCL_DEBUG", "INFO")
+    os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
+    os.environ.setdefault("TORCH_FR_BUFFER_SIZE", "1048576")
+
+
 def setup_distributed() -> Tuple[int, int, int]:
     """
     检测 torchrun 环境，初始化分布式训练
@@ -52,8 +79,16 @@ def setup_distributed() -> Tuple[int, int, int]:
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        dist.init_process_group(backend="nccl", init_method="env://")
+        # 必须先 set_device，再 init_process_group
+        # 否则 NCCL 不知道绑定哪张 GPU，会导致多卡训练卡死
+        # 注意：不要传 device_id 参数！该参数会触发 eager NCCL ALLREDUCE，
+        # 在本机 PCIe 拓扑下会永久卡死（10 分钟超时后崩溃）
         torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            timeout=timedelta(minutes=60),
+        )
         return rank, local_rank, world_size
     return 0, 0, 1
 
@@ -66,6 +101,27 @@ def cleanup_distributed():
 
 def is_main_process(rank: int) -> bool:
     return rank == 0
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """
+    解包 DDP 包装，返回底层模型
+
+    DDP 包装后 model 是 DistributedDataParallel 对象，不会自动代理
+    compute_loss / _prepare_target 等自定义方法，需通过 .module 访问。
+    """
+    return model.module if hasattr(model, "module") else model
+
+
+def sync_ranks(world_size: int, local_rank: int) -> None:
+    """
+    分布式同步屏障（显式指定当前 rank 绑定 GPU）
+
+    传入 device_ids 避免 NCCL 在 barrier 阶段出现 "device unknown" 警告，
+    降低多卡初始化阶段卡死风险。
+    """
+    if world_size > 1:
+        dist.barrier(device_ids=[local_rank])
 
 
 def get_cosine_schedule_with_warmup(
@@ -161,6 +217,7 @@ def setup_physics(config: dict) -> Tuple[
     Optional[SourceSpace],
     Optional[LeadfieldManager],
     Optional[ElectrodeConfigRegistry],
+    bool,
 ]:
     """
     初始化物理约束组件（SourceSpace + LeadfieldManager + ElectrodeConfigRegistry）
@@ -172,8 +229,8 @@ def setup_physics(config: dict) -> Tuple[
         config: 完整配置字典
 
     返回:
-        (source_space, leadfield_manager, electrode_registry) 元组
-        如果配置中未启用物理约束，所有返回值为 None
+        (source_space, leadfield_manager, electrode_registry, loaded_from_archive) 元组
+        如果配置中未启用物理约束，所有返回值为 None / False
     """
     physics_cfg = config.get("model", {}).get("physics", {})
     use_fixed_leadfield = physics_cfg.get("use_fixed_leadfield", True)
@@ -181,7 +238,7 @@ def setup_physics(config: dict) -> Tuple[
 
     if not use_fixed_leadfield or leadfield_path is not None:
         logger.info("物理约束模式: 静态导联场或注意力模式，跳过动态导联场初始化")
-        return None, None, None
+        return None, None, None, False
 
     global_physics = config.get("physics", {})
     subjects_dir = global_physics.get("subjects_dir")
@@ -211,6 +268,7 @@ def setup_physics(config: dict) -> Tuple[
         logger.info(
             f"  已加载 {len(electrode_registry.get_all_fingerprints())} 个唯一电极指纹"
         )
+        return source_space, leadfield_manager, electrode_registry, True
     else:
         if not processed_data_dir:
             raise RuntimeError(
@@ -230,8 +288,7 @@ def setup_physics(config: dict) -> Tuple[
         logger.info(
             f"  已注册电极配置: {electrode_registry.registered_configs}"
         )
-
-    return source_space, leadfield_manager, electrode_registry
+        return source_space, leadfield_manager, electrode_registry, False
 
 
 def train_one_epoch(
@@ -243,6 +300,7 @@ def train_one_epoch(
     config: dict,
     writer: SummaryWriter = None,
     global_step: int = 0,
+    max_steps: int = 100000,
     leadfield_manager: Optional[LeadfieldManager] = None,
     electrode_registry: Optional[ElectrodeConfigRegistry] = None,
     scaler: Optional[torch.amp.GradScaler] = None,
@@ -251,7 +309,6 @@ def train_one_epoch(
     world_size: int = 1,
 ):
     """训练一个 epoch"""
-    del world_size  # 保留参数以对齐 DDP 接口
     model.train()
     total_loss = 0.0
     total_recon_loss = 0.0
@@ -279,30 +336,37 @@ def train_one_epoch(
 
         use_amp = scaler is not None
         with torch.autocast(device_type="cuda", enabled=use_amp):
-            losses = model.compute_loss(
-                x, pos, sensor_type,
-                leadfield=leadfield,
-                loss_weights=loss_weights,
+            # 前向传播必须通过 DDP wrapper，才能触发梯度 all-reduce hook
+            output = model(x, pos, sensor_type, leadfield=leadfield, return_source=True)
+            # 损失计算通过 unwrap_model，避免 DDP 对纯计算方法的 AttributeError
+            losses = unwrap_model(model).compute_loss_from_output(
+                output, x, loss_weights=loss_weights
             )
             loss = losses["loss"]
 
         recon_loss = losses["recon_loss"]
         dynamics_loss = losses["dynamics_loss"]
+        optimizer_stepped = False
 
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             if gradient_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            # AMP 出现溢出时会跳过 optimizer.step，此时不应推进 scheduler。
+            scale_after = scaler.get_scale()
+            optimizer_stepped = scale_after >= scale_before
         else:
             loss.backward()
             if gradient_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
             optimizer.step()
+            optimizer_stepped = True
 
-        if scheduler is not None:
+        if scheduler is not None and optimizer_stepped:
             scheduler.step()
 
         total_loss += loss.item()
@@ -311,13 +375,21 @@ def train_one_epoch(
         num_batches += 1
         global_step += 1
 
+        if global_step >= max_steps:
+            if is_main_process(rank):
+                logger.info(f"达到最大训练步数 {max_steps}，提前结束当前 epoch")
+            break
+
         if is_main_process(rank) and batch_idx % log_interval == 0:
             avg_loss = total_loss / num_batches
+            dyn_val = dynamics_loss.item()
+            # 动力学损失通常极小，用科学计数法显示；较大时回退定点格式
+            dyn_fmt = f"{dyn_val:.2e}" if dyn_val < 0.001 else f"{dyn_val:.4f}"
             logger.info(
                 f"Epoch {epoch} [{batch_idx}/{len(dataloader)}] "
                 f"Loss: {loss.item():.4f} (avg: {avg_loss:.4f}) "
                 f"Recon: {recon_loss.item():.4f} "
-                f"Dynamics: {dynamics_loss.item():.4f}"
+                f"Dynamics: {dyn_fmt}"
             )
 
             if writer is not None and is_main_process(rank):
@@ -327,7 +399,9 @@ def train_one_epoch(
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-    return avg_loss, global_step
+    # 跨 rank 归约训练损失，使 rank 0 记录的是全局平均值
+    avg_loss_t = reduce_metric(torch.tensor(avg_loss, device=device), world_size)
+    return avg_loss_t.item(), global_step
 
 
 @torch.no_grad()
@@ -342,7 +416,6 @@ def evaluate(
     world_size: int = 1,
 ):
     """评估模型"""
-    del rank
     model.eval()
     total_loss = 0.0
     total_recon_loss = 0.0
@@ -366,18 +439,12 @@ def evaluate(
                 leadfield_manager, electrode_registry, device,
             )
 
-        losses = model.compute_loss(
-            x, pos, sensor_type,
-            leadfield=leadfield,
-            loss_weights=loss_weights,
-        )
-
+        # 单次 forward：loss 和指标均从同一次输出计算，避免冗余推理
         output = model(x, pos, sensor_type, leadfield=leadfield, return_source=True)
         reconstruction = output["reconstruction"]
-        target = (
-            model.module._prepare_target(x, reconstruction.shape[-1])
-            if hasattr(model, 'module')
-            else model._prepare_target(x, reconstruction.shape[-1])
+        target = unwrap_model(model)._prepare_target(x, reconstruction.shape[-1])
+        losses = unwrap_model(model).compute_loss_from_output(
+            output, x, loss_weights=loss_weights
         )
         metrics_batch = compute_all_metrics(target, reconstruction)
 
@@ -410,16 +477,25 @@ def evaluate(
 
 
 def main():
-    rank, local_rank, world_size = setup_distributed()
-    if not is_main_process(rank):
-        logging.getLogger().setLevel(logging.WARNING)
-
     parser = argparse.ArgumentParser(description="PENCI 训练脚本")
     parser.add_argument("--config", type=str, default="configs/default.yaml", help="配置文件路径")
     parser.add_argument("--resume", type=str, default=None, help="恢复训练的检查点路径")
     parser.add_argument("--output_dir", type=str, default=None, help="输出目录")
     parser.add_argument("--debug", action="store_true", help="调试模式")
+    parser.add_argument(
+        "--ddp_mode",
+        type=str,
+        default="prod",
+        choices=["prod", "debug"],
+        help="分布式运行模式: prod=性能优先, debug=诊断优先",
+    )
     args = parser.parse_args()
+
+    configure_ddp_mode(args.ddp_mode)
+
+    rank, local_rank, world_size = setup_distributed()
+    if not is_main_process(rank):
+        logging.getLogger().setLevel(logging.WARNING)
 
     writer = None
     try:
@@ -438,11 +514,26 @@ def main():
             output_dir.mkdir(parents=True, exist_ok=True)
             checkpoint_dir.mkdir(exist_ok=True)
             log_dir.mkdir(exist_ok=True)
-        if world_size > 1:
-            dist.barrier()
-
+            # === 文件日志：同时写入带时间戳的 train_<timestamp>.log ===
+            _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file = output_dir / f"train_{_ts}.log"
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+            )
+            logging.getLogger().addHandler(file_handler)
+            logger.info(f"训练日志将同步写入: {log_file}")
         if is_main_process(rank):
             logger.info(f"输出目录: {output_dir}")
+            logger.info(f"DDP 模式: {args.ddp_mode}")
+            if args.ddp_mode == "debug":
+                logger.info(
+                    "DDP 诊断环境: "
+                    f"NCCL_DEBUG={os.environ.get('NCCL_DEBUG')}, "
+                    f"TORCH_DISTRIBUTED_DEBUG={os.environ.get('TORCH_DISTRIBUTED_DEBUG')}, "
+                    f"TORCH_FR_BUFFER_SIZE={os.environ.get('TORCH_FR_BUFFER_SIZE')}"
+                )
 
         if world_size > 1:
             device = torch.device(f"cuda:{local_rank}")
@@ -452,7 +543,7 @@ def main():
             logger.info(f"使用设备: {device}")
 
         # === 物理约束组件初始化 ===
-        source_space, leadfield_manager, electrode_registry = setup_physics(config)
+        source_space, leadfield_manager, electrode_registry, registry_from_archive = setup_physics(config)
 
         # === 创建模型 ===
         if is_main_process(rank):
@@ -466,6 +557,8 @@ def main():
                 output_device=local_rank,
                 find_unused_parameters=config.get("distributed", {}).get("find_unused_parameters", False),
             )
+            # 在 DDP 包装后做首次同步，确保 rank->GPU 映射已明确
+            sync_ranks(world_size, local_rank)
 
         if is_main_process(rank):
             total_params = sum(p.numel() for p in model.parameters())
@@ -514,8 +607,8 @@ def main():
             if use_fingerprint:
                 logger.info("电极指纹分桶: 启用")
 
-        # 自动注册数据加载器中实际出现的所有数据集的电极配置
-        if electrode_registry is not None:
+        # 已从存档加载时，指纹已完备，无需再扫描 ProcessedData
+        if electrode_registry is not None and not registry_from_archive:
             loaded_datasets = set()
             for m in train_loader.dataset.metadata:
                 loaded_datasets.add(m.get("dataset", "unknown"))
@@ -529,24 +622,29 @@ def main():
             logger.info(
                 f"  最终电极配置: {electrode_registry.registered_configs}"
             )
+        if electrode_registry is not None and is_main_process(rank):
             logger.info(
-                f"  已注册指纹: {electrode_registry.get_all_fingerprints()}"
+                f"  已注册指纹数: {len(electrode_registry.get_all_fingerprints())}"
             )
 
         # === 导联场预热 ===
         # 预计算所有已注册指纹对应的导联场，避免训练循环中首次命中时卡顿
+        # 仅 rank 0 执行预热（填充磁盘缓存），其他 rank 等待后从缓存读取
         if leadfield_manager is not None and electrode_registry is not None:
             all_fps = electrode_registry.get_all_fingerprints()
             if all_fps:
-                logger.info(f"预热导联场: {len(all_fps)} 个唯一电极配置...")
-                for fp in all_fps:
-                    try:
-                        names, positions = electrode_registry.get_config_by_fingerprint(fp)
-                        L = leadfield_manager.get_leadfield(names, positions, device)
-                        logger.info(f"  指纹 {fp}: 导联场 {L.shape}")
-                    except Exception as e:
-                        logger.warning(f"  指纹 {fp} 导联场预热失败: {e}")
-                logger.info("导联场预热完成")
+                if is_main_process(rank):
+                    logger.info(f"预热导联场: {len(all_fps)} 个唯一电极配置 (仅 rank 0)...")
+                    for fp in all_fps:
+                        try:
+                            names, positions = electrode_registry.get_config_by_fingerprint(fp)
+                            L = leadfield_manager.get_leadfield(names, positions, device)
+                            logger.info(f"  指纹 {fp}: 导联场 {L.shape}")
+                        except Exception as e:
+                            logger.warning(f"  指纹 {fp} 导联场预热失败: {e}")
+                    logger.info("导联场预热完成")
+                # 所有 rank 同步：确保 rank 0 预热完毕，其他 rank 可从磁盘缓存加载
+                sync_ranks(world_size, local_rank)
 
         # === 优化器与调度器 ===
         base_lr = training_config.get("learning_rate", 1e-4)
@@ -610,10 +708,16 @@ def main():
             if is_main_process(rank):
                 logger.info(f"=== Epoch {epoch + 1}/{max_epochs} ===")
 
+            # BucketBatchSampler / DistributedBucketBatchSampler 路径
             if hasattr(train_loader, "batch_sampler") and hasattr(
                 train_loader.batch_sampler, "set_epoch"
             ):
                 train_loader.batch_sampler.set_epoch(epoch)
+            # 标准 DistributedSampler 路径（非 bucket 模式）
+            elif hasattr(train_loader, "sampler") and hasattr(
+                train_loader.sampler, "set_epoch"
+            ):
+                train_loader.sampler.set_epoch(epoch)
 
             train_loss, global_step = train_one_epoch(
                 model,
@@ -624,6 +728,7 @@ def main():
                 config,
                 writer,
                 global_step,
+                max_steps=max_steps,
                 leadfield_manager=leadfield_manager,
                 electrode_registry=electrode_registry,
                 scaler=scaler,
@@ -671,8 +776,7 @@ def main():
                         val_metrics["loss"],
                         checkpoint_dir / "best_model.pt",
                     )
-                if world_size > 1:
-                    dist.barrier()
+                sync_ranks(world_size, local_rank)
 
             if (epoch + 1) % 5 == 0:
                 if is_main_process(rank):
@@ -686,8 +790,7 @@ def main():
                         val_metrics["loss"],
                         checkpoint_dir / f"epoch_{epoch + 1}.pt",
                     )
-                if world_size > 1:
-                    dist.barrier()
+                sync_ranks(world_size, local_rank)
 
             if global_step >= max_steps:
                 if is_main_process(rank):
@@ -708,8 +811,7 @@ def main():
                 val_metrics["loss"],
                 checkpoint_dir / "final_model.pt",
             )
-        if world_size > 1:
-            dist.barrier()
+        sync_ranks(world_size, local_rank)
 
         if is_main_process(rank):
             logger.info("训练完成！")

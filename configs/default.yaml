@@ -71,7 +71,7 @@ physics:
 training:
   # --- 单卡基准参数 (DDP 自动缩放，见下方注释) ---
   batch_size: 32                # 每卡批次大小 (per-GPU batch size)
-  num_workers: 4                # 每卡数据加载线程数
+  num_workers: 4                # 每卡数据加载线程数 (8GPU×4=32进程；全部HDF5后NFS小文件压力消失，从2恢复至4)
   learning_rate: 1.0e-4         # 单卡基准学习率
   weight_decay: 0.01            # 权重衰减
   warmup_steps: 1000            # 学习率线性预热步数

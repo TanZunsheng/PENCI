@@ -126,9 +126,12 @@ class PENCI(nn.Module):
                 dropout=dropout,
             )
         
-        # 3. 传感器嵌入（解码时需要）
-        self.sensor_module = BrainSensorModule(n_dim)
-        
+        # 3. 传感器嵌入（仅注意力解码模式需要；导联场模式下 decoder 不使用该嵌入，
+        #    不初始化可避免 DDP find_unused_parameters 报错）
+        self._use_fixed_leadfield = use_fixed_leadfield
+        if not use_fixed_leadfield:
+            self.sensor_module = BrainSensorModule(n_dim)
+
         # 4. 物理解码器
         self.decoder = PhysicsDecoder(
             n_dim=n_dim,
@@ -184,11 +187,12 @@ class PENCI(nn.Module):
         # 输入输出: (B, N_neuro, T_total, D)
         source_evolved = self.dynamics(source_flat)
         
-        # 3. 计算传感器嵌入
-        sensor_embedding = self.sensor_module(pos, sensor_type)  # (B, C, D)
-        
+        # 3. 计算传感器嵌入（仅注意力解码模式需要）
+        sensor_embedding = None
+        if not self._use_fixed_leadfield:
+            sensor_embedding = self.sensor_module(pos, sensor_type)  # (B, C, D)
+
         # 4. 物理解码：源空间 -> 传感器空间
-        # 传递导联场到解码器（动态导联场模式）
         reconstruction = self.decoder(
             source_evolved, sensor_embedding, leadfield=leadfield
         )
@@ -261,6 +265,53 @@ class PENCI(nn.Module):
             "dynamics_loss": dynamics_loss,
         }
     
+    def compute_loss_from_output(
+        self,
+        output: Dict[str, torch.Tensor],
+        x: torch.Tensor,
+        loss_weights: Dict[str, float] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        从已有的 forward 输出计算损失（DDP 训练专用）
+
+        DDP 要求前向传播必须经过 DistributedDataParallel.__call__ 以注册梯度
+        all-reduce hook。本方法将 forward 与 loss 计算解耦：
+          - 训练循环调用 model(x, ...) 走 DDP wrapper → 梯度正常同步
+          - 再调用本方法从输出计算损失 → 不触发额外 forward
+
+        参数:
+            output: model(x, ..., return_source=True) 的输出字典，
+                    必须包含 reconstruction 和 source_activity
+            x: 原始输入信号 (B, C, T)，用于生成自重建目标
+            loss_weights: 各损失项权重字典
+
+        返回:
+            字典包含 loss, recon_loss, dynamics_loss
+        """
+        if loss_weights is None:
+            loss_weights = {"reconstruction": 1.0, "dynamics": 0.1}
+
+        reconstruction = output["reconstruction"]
+        source_activity = output["source_activity"]
+
+        target = self._prepare_target(x, reconstruction.shape[-1])
+
+        recon_loss = F.mse_loss(reconstruction, target)
+        dynamics_loss = torch.mean(
+            (source_activity[:, :, 1:, :] - source_activity[:, :, :-1, :]) ** 2
+        )
+
+        total_loss = (
+            loss_weights.get("reconstruction", 1.0) * recon_loss
+            + loss_weights.get("dynamics", 0.1) * dynamics_loss
+        )
+
+        return {
+            "loss": total_loss,
+            "recon_loss": recon_loss,
+            "dynamics_loss": dynamics_loss,
+        }
+
     def _prepare_target(self, x: torch.Tensor, target_len: int) -> torch.Tensor:
         """准备目标信号（下采样到匹配输出长度）"""
         B, C, T = x.shape
@@ -321,9 +372,9 @@ class PENCILite(nn.Module):
             dropout=dropout,
         )
         
-        # 传感器嵌入
-        self.sensor_module = BrainSensorModule(n_dim)
-        
+        # PENCILite 始终使用固定导联场，sensor_module 不参与计算，无需初始化
+        self._use_fixed_leadfield = True
+
         # 固定导联场解码器
         self.decoder = PhysicsDecoder(
             n_dim=n_dim,
@@ -366,12 +417,9 @@ class PENCILite(nn.Module):
         # 动力学
         source_evolved = self.dynamics(source_flat)
         
-        # 传感器嵌入
-        sensor_embedding = self.sensor_module(pos, sensor_type)  # (B, C, D)
-        
-        # 解码（传递导联场到解码器）
+        # 解码（PENCILite 始终使用固定导联场，sensor_embedding 不参与计算）
         reconstruction = self.decoder(
-            source_evolved, sensor_embedding, leadfield=leadfield
+            source_evolved, None, leadfield=leadfield
         )
         
         return {"reconstruction": reconstruction}

@@ -95,7 +95,7 @@ logs/
 tensorboard/
 
 # Data (large files)
-data/
+/data/
 *.h5
 *.hdf5
 *.npy

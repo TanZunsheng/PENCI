@@ -69,6 +69,16 @@ def load_config(config_path: str) -> dict:
     return config
 
 
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    解包 DDP 包装，返回底层模型
+
+    DDP 包装后 model 是 DistributedDataParallel 对象，不会自动代理
+    compute_loss / _prepare_target 等自定义方法，需通过 .module 访问。
+    """
+    return model.module if hasattr(model, "module") else model
+
+
 def load_model_from_checkpoint(
     config: dict,
     checkpoint_path: str,
@@ -242,7 +252,7 @@ def evaluate_sensor_space(
         reconstruction = output["reconstruction"]
 
         # 准备目标 (下采样输入以匹配输出长度)
-        target = model._prepare_target(x, reconstruction.shape[-1])
+        target = unwrap_model(model)._prepare_target(x, reconstruction.shape[-1])
 
         # 计算指标
         metrics = compute_all_metrics(target, reconstruction)

@@ -1,0 +1,110 @@
+# PENCI 冒烟测试配置
+# 用途：快速验证多卡训练流程是否正常，不追求训练效果
+# 用法：bash scripts/run_train_8gpu.sh --config configs/smoke_test.yaml
+# ================
+
+# 模型配置 (与 default 相同，保持模型结构一致)
+model:
+  n_dim: 256
+  n_neuro: 72
+  n_head: 4
+  dropout: 0.0
+
+  seanet:
+    n_filters: 32
+    ratios: [8, 4, 2]
+    kernel_size: 7
+    residual_kernel_size: 3
+    last_kernel_size: 7
+    dilation_base: 2
+    causal: false
+    norm: "weight_norm"
+    lstm: 2
+
+  dynamics:
+    type: "transformer"
+    n_layers: 4
+    n_heads: 8
+    dim_feedforward: 1024
+    dropout: 0.1
+
+  physics:
+    use_fixed_leadfield: true
+    leadfield_path: null
+
+# 数据配置 (与 default 相同)
+data:
+  root_dir: "/work/2024/tanzunsheng/PENCIData"
+  datasets:
+    - "HBN_EEG"
+    - "Brennan_Hale2019"
+    - "Grootswagers2019"
+    - "THINGS-EEG"
+    - "ThingsEEG"
+    - "SEED-DV"
+    - "Broderick2018_NaturalSpeech"
+    - "Broderick2018_NaturalSpeechReverse"
+    - "Broderick2018_SpeechInNoise"
+    - "Broderick2018_CocktailParty"
+  sample_rate: 256
+  window_length: 256
+  n_channels: 128
+  time_window: 10
+  stride: 5
+  use_bucket_sampler: true
+
+# 物理约束配置 (与 default 相同)
+physics:
+  subjects_dir: "/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data"
+  leadfield_cache_dir: "/work/2024/tanzunsheng/leadfield_cache"
+  processed_data_dir: "/work/2024/tanzunsheng/ProcessedData"
+  fingerprint_registry_path: "/work/2024/tanzunsheng/leadfield_cache/fingerprint_registry.pt"
+
+# 训练配置 (冒烟测试关键修改：极少步数，高频日志)
+training:
+  batch_size: 4                 # 减小 batch_size，降低显存压力，加快单步速度
+  num_workers: 2
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 5               # 极短预热
+  max_steps: 20                 # 只跑 20 步，验证流程即可
+  gradient_clip: 1.0
+  loss:
+    reconstruction: 1.0
+    dynamics: 0.1
+  log_interval: 1               # 每步都打印日志
+  save_interval: 10             # 第 10 步保存一次检查点
+  eval_interval: 10             # 第 10 步评估一次
+
+# 分布式训练配置
+distributed:
+  backend: "nccl"
+  find_unused_parameters: false
+
+# 硬件配置
+hardware:
+  device: "cuda"
+  mixed_precision: true
+  compile: false
+
+# 评估配置 (与 default 相同)
+evaluation:
+  sensor_metrics:
+    - "pearson"
+    - "snr_db"
+    - "nrmse"
+  source_comparison:
+    method: "sLORETA"
+    lambda2: 0.1111
+    loose: 0.2
+    depth: 0.8
+  simulation:
+    n_trials: 50
+    n_dipoles: 1
+    nave: 20
+
+# 路径配置
+paths:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  output_dir: "outputs"
