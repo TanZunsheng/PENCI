@@ -641,6 +641,7 @@ class DistributedBucketBatchSampler(Sampler):
         self._cached_epoch = -1
         self._cached_batches: List[List[int]] = []
         self._cached_file_plan: List[str] = []
+        self._cached_rank_schedule: List[Dict[str, Any]] = []
 
         self._total_batches = 0
         self._refresh_cached_plan(epoch=0)
@@ -679,7 +680,7 @@ class DistributedBucketBatchSampler(Sampler):
         if self.rank == 0 and self.file_scheduler:
             logger.info(
                 "  文件级调度: 启用（同一 batch 只来自一个 HDF5 文件，"
-                f"文件内{'打乱' if self.shuffle_within_file else '顺序'}采样）"
+                f"整文件 block 连续消费，文件内{'打乱' if self.shuffle_within_file else '顺序'}采样）"
             )
 
     def _cluster_shuffle(
@@ -760,18 +761,42 @@ class DistributedBucketBatchSampler(Sampler):
 
         return rank_batches
 
-    def _build_file_scheduled_bucket_batches(
+    @staticmethod
+    def _truncate_file_blocks(
+        file_blocks: List[List[List[int]]],
+        target_batches: int,
+    ) -> List[List[List[int]]]:
+        """按 batch 数裁剪文件块列表，尽量保留整块连续消费。"""
+        if target_batches <= 0:
+            return []
+
+        kept_blocks: List[List[List[int]]] = []
+        remaining = target_batches
+        for block in file_blocks:
+            if remaining <= 0:
+                break
+            if len(block) <= remaining:
+                kept_blocks.append(block)
+                remaining -= len(block)
+                continue
+            kept_blocks.append(block[:remaining])
+            remaining = 0
+            break
+        return kept_blocks
+
+    def _build_file_scheduled_bucket_blocks(
         self,
         ids_bucket: List[int],
         g: torch.Generator,
         total_batch_size: int,
-    ) -> List[List[int]]:
+    ) -> List[List[List[int]]]:
         """
-        文件级调度：先按 HDF5 文件分组，再把整文件 batch 分配给 rank。
+        文件级调度：先按 HDF5 文件分组，再把整文件 batch block 分配给 rank。
 
         目的：
         1. 同一 batch 只来自一个 HDF5 文件
-        2. 降低同一时刻跨 rank 争抢同一文件的概率
+        2. 同一文件在当前 rank 上尽量连续消费，符合块级缓存语义
+        3. 降低同一时刻跨 rank 争抢同一文件的概率
         """
         groups: Dict[str, List[int]] = defaultdict(list)
         for idx in ids_bucket:
@@ -779,7 +804,7 @@ class DistributedBucketBatchSampler(Sampler):
 
         # 缺少文件信息时退回默认策略
         if not groups:
-            return self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
+            return [[batch] for batch in self._build_default_bucket_batches(ids_bucket, g, total_batch_size)]
 
         group_keys = sorted(groups.keys())
         if self.shuffle:
@@ -788,7 +813,7 @@ class DistributedBucketBatchSampler(Sampler):
 
         # 文件数过少时，文件级分配会让部分 rank 没有 batch，退回默认策略
         if len(group_keys) < self.num_replicas:
-            return self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
+            return [[batch] for batch in self._build_default_bucket_batches(ids_bucket, g, total_batch_size)]
 
         file_batches: List[Tuple[str, List[List[int]]]] = []
         for gk in group_keys:
@@ -812,51 +837,81 @@ class DistributedBucketBatchSampler(Sampler):
                 file_batches.append((gk, batches))
 
         if not file_batches:
-            return self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
+            return [[batch] for batch in self._build_default_bucket_batches(ids_bucket, g, total_batch_size)]
 
         # 按文件可贡献的 batch 数做负载均衡，减少后续 min_batches 截断造成的样本浪费。
         # 先随机化原始顺序（训练时）再按 batch 数降序稳定排序，可保留同规模文件间的随机性。
         file_batches.sort(key=lambda item: len(item[1]), reverse=True)
 
-        rank_batches: List[List[List[int]]] = [[] for _ in range(self.num_replicas)]
+        rank_file_blocks: List[List[List[List[int]]]] = [[] for _ in range(self.num_replicas)]
         rank_batch_counts = [0] * self.num_replicas
         for _, batches in file_batches:
             owner_rank = min(
                 range(self.num_replicas),
                 key=lambda rank_idx: (rank_batch_counts[rank_idx], rank_idx),
             )
-            rank_batches[owner_rank].extend(batches)
+            rank_file_blocks[owner_rank].append(batches)
             rank_batch_counts[owner_rank] += len(batches)
 
-        min_batches = min(len(b) for b in rank_batches)
+        min_batches = min(rank_batch_counts)
         if min_batches <= 0:
             # 某些小桶可能出现极端不均衡，退回默认策略保证训练不挂
-            return self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
+            return [[batch] for batch in self._build_default_bucket_batches(ids_bucket, g, total_batch_size)]
 
-        return rank_batches[self.rank][:min_batches]
+        truncated_rank_blocks = [
+            self._truncate_file_blocks(blocks, min_batches)
+            for blocks in rank_file_blocks
+        ]
+        return truncated_rank_blocks[self.rank]
 
-    def _build_epoch_batches(self, epoch: int) -> Tuple[List[List[int]], List[str]]:
-        """构建指定 epoch 的 batch 列表和预取文件计划。"""
+    def _get_batch_hdf5_path(self, batch: List[int]) -> str:
+        """返回 batch 共享的 HDF5 路径；若 batch 混入多个文件则返回空串。"""
+        if not batch:
+            return ""
+
+        h5_path = self._idx_to_h5.get(batch[0], "")
+        if not h5_path:
+            return ""
+
+        for idx in batch[1:]:
+            if self._idx_to_h5.get(idx, "") != h5_path:
+                return ""
+        return h5_path
+
+    def _build_epoch_batches(
+        self,
+        epoch: int,
+    ) -> Tuple[List[List[int]], List[str], List[Dict[str, Any]]]:
+        """构建指定 epoch 的 batch 列表、去重文件计划和 rank 级窗口计划。"""
         g = torch.Generator()
         g.manual_seed(self.seed + epoch)
 
         all_batches: List[List[int]] = []
+        all_file_blocks: List[List[List[int]]] = []
         total_batch_size = self.num_replicas * self.batch_size
 
         for key in sorted(self.buckets.keys(), key=lambda x: str(x)):
             ids_bucket = self.buckets[key].copy()
 
             if self.file_scheduler and self.cluster_by_file and self._idx_to_h5:
-                bucket_batches = self._build_file_scheduled_bucket_batches(
+                bucket_file_blocks = self._build_file_scheduled_bucket_blocks(
                     ids_bucket, g, total_batch_size
                 )
+                all_file_blocks.extend(bucket_file_blocks)
             else:
                 bucket_batches = self._build_default_bucket_batches(
                     ids_bucket, g, total_batch_size
                 )
-            all_batches.extend(bucket_batches)
+                all_batches.extend(bucket_batches)
 
-        if self.shuffle:
+        if self.file_scheduler and self.cluster_by_file and self._idx_to_h5:
+            if self.shuffle and all_file_blocks:
+                perm = torch.randperm(len(all_file_blocks), generator=g).tolist()
+                all_file_blocks = [all_file_blocks[i] for i in perm]
+            all_batches = []
+            for file_block in all_file_blocks:
+                all_batches.extend(file_block)
+        elif self.shuffle:
             if self.cluster_by_file:
                 # 按块打乱：保持 I/O 局部性的同时提供训练随机性
                 chunk_size = max(1, self.batch_size // 2)
@@ -874,23 +929,64 @@ class DistributedBucketBatchSampler(Sampler):
         # 预取计划：按 batch 消费顺序提取去重后的 HDF5 文件序列
         file_plan: List[str] = []
         seen: set = set()
+        rank_schedule: List[Dict[str, Any]] = []
+        current_h5_path = ""
+        current_start_idx = -1
+        current_batches = 0
+
+        def flush_rank_schedule_segment() -> None:
+            nonlocal current_h5_path, current_start_idx, current_batches
+            if not current_h5_path or current_start_idx < 0 or current_batches <= 0:
+                current_h5_path = ""
+                current_start_idx = -1
+                current_batches = 0
+                return
+            rank_schedule.append(
+                {
+                    "hdf5_path": current_h5_path,
+                    "n_batches": current_batches,
+                    "first_batch_idx": current_start_idx,
+                    "last_batch_idx": current_start_idx + current_batches - 1,
+                }
+            )
+            current_h5_path = ""
+            current_start_idx = -1
+            current_batches = 0
+
         for batch in all_batches:
             if not batch:
                 continue
-            h5_path = self._idx_to_h5.get(batch[0], "")
+            h5_path = self._get_batch_hdf5_path(batch)
             if h5_path and h5_path not in seen:
                 seen.add(h5_path)
                 file_plan.append(h5_path)
+        for batch_idx, batch in enumerate(all_batches):
+            if not batch:
+                flush_rank_schedule_segment()
+                continue
+            h5_path = self._get_batch_hdf5_path(batch)
+            if not self.file_scheduler or not h5_path:
+                flush_rank_schedule_segment()
+                continue
+            if h5_path != current_h5_path:
+                flush_rank_schedule_segment()
+                current_h5_path = h5_path
+                current_start_idx = batch_idx
+                current_batches = 1
+            else:
+                current_batches += 1
+        flush_rank_schedule_segment()
 
-        return all_batches, file_plan
+        return all_batches, file_plan, rank_schedule
 
     def _refresh_cached_plan(self, epoch: int) -> None:
         if self._cached_epoch == epoch:
             return
-        batches, file_plan = self._build_epoch_batches(epoch)
+        batches, file_plan, rank_schedule = self._build_epoch_batches(epoch)
         self._cached_epoch = epoch
         self._cached_batches = batches
         self._cached_file_plan = file_plan
+        self._cached_rank_schedule = rank_schedule
 
     def __iter__(self) -> Iterator[List[int]]:
         """生成当前 rank 的 batch 索引列表"""
@@ -917,6 +1013,17 @@ class DistributedBucketBatchSampler(Sampler):
         if max_files > 0:
             return self._cached_file_plan[:max_files]
         return list(self._cached_file_plan)
+
+    def get_prefetch_rank_schedule(self) -> List[Dict[str, Any]]:
+        """
+        返回当前 rank 的 HDF5 文件消费窗口计划。
+
+        仅在 file_scheduler=true 时返回窗口列表；否则返回空列表。
+        """
+        if not self.file_scheduler:
+            return []
+        self._refresh_cached_plan(self.epoch)
+        return [dict(item) for item in self._cached_rank_schedule]
 
 
 class PENCICollator:

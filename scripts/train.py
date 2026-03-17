@@ -16,6 +16,7 @@ import sys
 import math
 import time
 import json
+import threading
 import argparse
 import logging
 from pathlib import Path
@@ -41,6 +42,22 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+prefetch_detail_logger = logging.getLogger("penci.prefetch_detail")
+prefetch_detail_logger.addHandler(logging.NullHandler())
+prefetch_detail_logger.propagate = False
+
+
+def configure_prefetch_detail_logger(log_file: Path) -> None:
+    """配置节点级预热/续热细节日志，避免刷屏主训练日志。"""
+    prefetch_detail_logger.setLevel(logging.INFO)
+    prefetch_detail_logger.propagate = False
+    prefetch_detail_logger.handlers = []
+    detail_handler = logging.FileHandler(log_file, encoding="utf-8")
+    detail_handler.setLevel(logging.INFO)
+    detail_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    )
+    prefetch_detail_logger.addHandler(detail_handler)
 
 
 def configure_ddp_mode(ddp_mode: str) -> None:
@@ -440,6 +457,334 @@ def get_prefetch_file_plan(
     return resolved
 
 
+def get_prefetch_rank_schedule(dataloader) -> List[Dict[str, Any]]:
+    """获取当前 rank 的文件消费窗口计划。"""
+    schedule: List[Dict[str, Any]] = []
+    batch_sampler = getattr(dataloader, "batch_sampler", None)
+    if batch_sampler is not None and hasattr(batch_sampler, "get_prefetch_rank_schedule"):
+        try:
+            schedule = batch_sampler.get_prefetch_rank_schedule()
+        except Exception as e:
+            logger.warning(f"读取 sampler rank 级文件计划失败: {e}")
+    return schedule
+
+
+def _summarize_prefetch_plan_files(file_plan: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """统计预热计划中的唯一文件数和唯一文件总字节数。"""
+    unique_files: Dict[str, int] = {}
+    for item in file_plan:
+        if not isinstance(item, dict):
+            continue
+        hdf5_path = str(item.get("hdf5_path", "")).strip()
+        if not hdf5_path or hdf5_path in unique_files:
+            continue
+        unique_files[hdf5_path] = int(item.get("size_bytes", 0))
+    return len(unique_files), sum(unique_files.values())
+
+
+def build_node_union_prefetch_plan(
+    rank_schedules: List[List[Dict[str, Any]]],
+    data_root: str,
+    max_files: int = 0,
+) -> List[Dict[str, Any]]:
+    """合并所有 rank 的文件消费窗口，构建节点级窗口预热计划。"""
+    merged_windows_by_path: Dict[str, List[Dict[str, Any]]] = {}
+    for rank_idx, schedule in enumerate(rank_schedules):
+        if not isinstance(schedule, list):
+            continue
+        for item in schedule:
+            if not isinstance(item, dict):
+                continue
+            hdf5_rel = str(item.get("hdf5_path", "")).strip()
+            if not hdf5_rel:
+                continue
+            hdf5_abs = hdf5_rel if os.path.isabs(hdf5_rel) else os.path.join(data_root, hdf5_rel)
+            if not os.path.isfile(hdf5_abs):
+                logger.warning(f"节点级预热计划跳过缺失文件: {hdf5_abs}")
+                continue
+
+            first_use_step = int(item.get("first_batch_idx", 0))
+            last_use_step = max(first_use_step, int(item.get("last_batch_idx", first_use_step)))
+            merged_windows_by_path.setdefault(hdf5_abs, []).append(
+                {
+                    "hdf5_path": hdf5_abs,
+                    "hdf5_rel": hdf5_rel,
+                    "size_bytes": os.path.getsize(hdf5_abs),
+                    "first_use_step": first_use_step,
+                    "last_use_step": last_use_step,
+                    "ranks": {rank_idx},
+                }
+            )
+
+    plan: List[Dict[str, Any]] = []
+    for windows in merged_windows_by_path.values():
+        windows.sort(key=lambda item: (item["first_use_step"], item["last_use_step"]))
+        merged_windows: List[Dict[str, Any]] = []
+        for item in windows:
+            if (
+                merged_windows
+                and item["first_use_step"] <= merged_windows[-1]["last_use_step"] + 1
+            ):
+                merged_windows[-1]["last_use_step"] = max(
+                    merged_windows[-1]["last_use_step"], item["last_use_step"]
+                )
+                merged_windows[-1]["ranks"].update(item["ranks"])
+            else:
+                merged_windows.append(
+                    {
+                        "hdf5_path": item["hdf5_path"],
+                        "hdf5_rel": item["hdf5_rel"],
+                        "size_bytes": item["size_bytes"],
+                        "first_use_step": item["first_use_step"],
+                        "last_use_step": item["last_use_step"],
+                        "ranks": set(item["ranks"]),
+                    }
+                )
+        for item in merged_windows:
+            item["n_batches"] = item["last_use_step"] - item["first_use_step"] + 1
+            item["ranks"] = sorted(item["ranks"])
+            plan.append(item)
+
+    plan.sort(key=lambda item: (item["first_use_step"], item["hdf5_path"], item["last_use_step"]))
+    if max_files > 0:
+        return plan[:max_files]
+    return plan
+
+
+class NodePageCachePrefetcher:
+    """单节点 page cache 预取器：按窗口预热 + 训练期后台续热。"""
+
+    def __init__(
+        self,
+        file_plan: List[Dict[str, Any]],
+        high_watermark_gb: float,
+        low_watermark_gb: float,
+        read_chunk_mb: int = 8,
+        max_threads: int = 1,
+    ):
+        self.file_plan = file_plan
+        self.high_watermark_bytes = _gib_to_bytes(high_watermark_gb)
+        self.low_watermark_bytes = min(
+            self.high_watermark_bytes,
+            _gib_to_bytes(max(0.0, low_watermark_gb)),
+        )
+        self.read_chunk_bytes = max(1, int(read_chunk_mb)) * 1024 * 1024
+        self.plan_window_count = len(file_plan)
+        self.plan_file_count, self.total_plan_bytes = _summarize_prefetch_plan_files(file_plan)
+        self.total_window_bytes = sum(int(item.get("size_bytes", 0)) for item in file_plan)
+        self.prefetched_cursor = 0
+        self.current_batch_idx = 0
+        self.active_prefetched_bytes = 0
+        self.active_prefetched_files = 0
+        self.total_prefetched_bytes = 0
+        self._prefetched = [False] * len(file_plan)
+        self._lock = threading.Lock()
+        self._wake_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._refill_requested = False
+
+        if max_threads != 1:
+            logger.info(
+                f"节点级后台续热线程数请求为 {max_threads}，为避免 NFS 抖动，当前按 1 线程顺序读取执行"
+            )
+
+    def _recompute_active_prefetched_bytes_unlocked(self) -> int:
+        active_paths: Dict[str, int] = {}
+        for prefetched, item in zip(self._prefetched, self.file_plan):
+            if prefetched and int(item.get("last_use_step", -1)) >= self.current_batch_idx:
+                hdf5_path = str(item.get("hdf5_path", "")).strip()
+                if hdf5_path and hdf5_path not in active_paths:
+                    active_paths[hdf5_path] = int(item.get("size_bytes", 0))
+        active_bytes = sum(active_paths.values())
+        self.active_prefetched_bytes = active_bytes
+        self.active_prefetched_files = len(active_paths)
+        return active_bytes
+
+    def get_status(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "plan_files": self.plan_file_count,
+                "plan_windows": self.plan_window_count,
+                "prefetched_cursor": self.prefetched_cursor,
+                "current_batch_idx": self.current_batch_idx,
+                "active_prefetched_bytes": self.active_prefetched_bytes,
+                "active_prefetched_files": self.active_prefetched_files,
+                "total_prefetched_bytes": self.total_prefetched_bytes,
+                "total_plan_bytes": self.total_plan_bytes,
+                "total_window_bytes": self.total_window_bytes,
+            }
+
+    def _prefetch_next_file(self, reason: str) -> bool:
+        with self._lock:
+            if self.prefetched_cursor >= len(self.file_plan):
+                self._refill_requested = False
+                return False
+            window_idx = self.prefetched_cursor
+            item = self.file_plan[window_idx]
+            self.prefetched_cursor += 1
+
+        hdf5_path = item["hdf5_path"]
+        file_size = int(item.get("size_bytes", 0))
+        try:
+            with open(hdf5_path, "rb", buffering=0) as f:
+                while True:
+                    buf = f.read(self.read_chunk_bytes)
+                    if not buf:
+                        break
+        except OSError as e:
+            logger.warning(f"节点级预热读取失败，跳过文件 {hdf5_path}: {e}")
+            with self._lock:
+                self._recompute_active_prefetched_bytes_unlocked()
+                self._refill_requested = (
+                    self.active_prefetched_bytes < self.high_watermark_bytes
+                    and self.prefetched_cursor < len(self.file_plan)
+                )
+            return False
+
+        with self._lock:
+            self._prefetched[window_idx] = True
+            self.total_prefetched_bytes += file_size
+            active_bytes = self._recompute_active_prefetched_bytes_unlocked()
+            active_files = self.active_prefetched_files
+            current_batch_idx = self.current_batch_idx
+            prefetched_cursor = self.prefetched_cursor
+            self._refill_requested = (
+                active_bytes < self.high_watermark_bytes
+                and prefetched_cursor < len(self.file_plan)
+            )
+
+        prefix = "启动预热" if reason == "warmup" else "后台续热"
+        prefetch_detail_logger.info(
+            f"[{prefix}] batch_idx={current_batch_idx} | "
+            f"窗口 {window_idx + 1}/{self.plan_window_count} | "
+            f"active {active_bytes / (1024 ** 3):.2f}/{self.high_watermark_bytes / (1024 ** 3):.2f} GiB | "
+            f"active_files={active_files} | "
+            f"已预热窗口 {prefetched_cursor}/{self.plan_window_count} | {item.get('hdf5_rel', hdf5_path)}"
+        )
+        return True
+
+    def warmup_to_high_watermark(self) -> float:
+        if self.high_watermark_bytes <= 0:
+            logger.info("节点级联合预热目标为 0 GiB，跳过启动前预热")
+            return 0.0
+        if not self.file_plan:
+            logger.warning("节点级联合预热计划为空，跳过启动前预热")
+            return 0.0
+
+        logger.info(
+            f"节点级联合预热计划: 窗口 {self.plan_window_count} 段 | "
+            f"唯一文件 {self.plan_file_count} 个 | "
+            f"唯一总大小 {self.total_plan_bytes / (1024 ** 3):.2f} GiB | "
+            f"高水位 {self.high_watermark_bytes / (1024 ** 3):.2f} GiB | "
+            f"低水位 {self.low_watermark_bytes / (1024 ** 3):.2f} GiB"
+        )
+
+        started_at = time.time()
+        while True:
+            with self._lock:
+                active_bytes = self._recompute_active_prefetched_bytes_unlocked()
+                prefetched_cursor = self.prefetched_cursor
+            if active_bytes >= self.high_watermark_bytes or prefetched_cursor >= len(self.file_plan):
+                break
+            progressed = self._prefetch_next_file(reason="warmup")
+            if not progressed and prefetched_cursor >= len(self.file_plan):
+                break
+
+            status = self.get_status()
+            elapsed = max(1e-6, time.time() - started_at)
+            speed_gib = (status["total_prefetched_bytes"] / (1024 ** 3)) / elapsed
+            active_gib = status["active_prefetched_bytes"] / (1024 ** 3)
+            high_gib = self.high_watermark_bytes / (1024 ** 3)
+            pct = 100.0 if high_gib <= 0 else min(100.0, (active_gib / high_gib) * 100.0)
+            remain_gib = max(0.0, high_gib - active_gib)
+            eta_min = 0.0 if speed_gib <= 1e-6 else remain_gib / speed_gib / 60.0
+            logger.info(
+                f"[节点联合预热进度] {active_gib:.2f}/{high_gib:.2f} GiB ({pct:.1f}%) | "
+                f"{speed_gib:.2f} GiB/s | ETA {eta_min:.1f} min"
+            )
+
+        warmed_gib = self.get_status()["active_prefetched_bytes"] / (1024 ** 3)
+        logger.info(f"节点级联合预热完成: 当前逻辑工作集 {warmed_gib:.2f} GiB")
+        return warmed_gib
+
+    def _run_refill_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._wake_event.wait(timeout=1.0)
+            self._wake_event.clear()
+            if self._stop_event.is_set():
+                break
+
+            while not self._stop_event.is_set():
+                with self._lock:
+                    active_bytes = self._recompute_active_prefetched_bytes_unlocked()
+                    need_refill = (
+                        active_bytes < self.high_watermark_bytes
+                        and self.prefetched_cursor < len(self.file_plan)
+                    )
+                    if not need_refill:
+                        self._refill_requested = False
+                        break
+                progressed = self._prefetch_next_file(reason="refill")
+                if not progressed:
+                    with self._lock:
+                        self._refill_requested = False
+                    break
+
+    def start_async_refill(self) -> None:
+        if self._thread is not None or not self.file_plan:
+            return
+        self._thread = threading.Thread(
+            target=self._run_refill_loop,
+            name="node-page-cache-prefetcher",
+            daemon=True,
+        )
+        self._thread.start()
+        prefetch_detail_logger.info(
+            "后台续热器已启动：单线程顺序读取，按低/高水位维持 page cache 工作集"
+        )
+
+    def update_progress(self, current_batch_idx: int) -> None:
+        with self._lock:
+            if current_batch_idx < self.current_batch_idx:
+                return
+            self.current_batch_idx = current_batch_idx
+            active_bytes = self._recompute_active_prefetched_bytes_unlocked()
+            prefetched_cursor = self.prefetched_cursor
+            need_refill = (
+                active_bytes < self.low_watermark_bytes
+                and prefetched_cursor < len(self.file_plan)
+            )
+            should_log = need_refill and not self._refill_requested
+            if need_refill:
+                self._refill_requested = True
+            elif active_bytes >= self.high_watermark_bytes or prefetched_cursor >= len(self.file_plan):
+                self._refill_requested = False
+
+        if should_log:
+            prefetch_detail_logger.info(
+                f"[后台续热触发] batch_idx={current_batch_idx} | "
+                f"active {active_bytes / (1024 ** 3):.2f}/{self.low_watermark_bytes / (1024 ** 3):.2f} GiB | "
+                f"已预热窗口 {prefetched_cursor}/{self.plan_window_count} | "
+                f"将补到 {self.high_watermark_bytes / (1024 ** 3):.2f} GiB"
+            )
+        if need_refill:
+            self._wake_event.set()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        status = self.get_status()
+        prefetch_detail_logger.info(
+            f"后台续热器已停止: batch_idx={status['current_batch_idx']} | "
+            f"active {status['active_prefetched_bytes'] / (1024 ** 3):.2f} GiB | "
+            f"已预热窗口 {status['prefetched_cursor']}/{status['plan_windows']}"
+        )
+
+
 def warmup_hdf5_page_cache(
     file_paths: List[str],
     warmup_gb: float,
@@ -665,6 +1010,7 @@ def train_one_epoch(
     rank: int = 0,
     world_size: int = 1,
     nan_guard: Optional[NaNGuard] = None,
+    node_prefetcher: Optional[NodePageCachePrefetcher] = None,
 ):
     """训练一个 epoch"""
     model.train()
@@ -923,6 +1269,9 @@ def train_one_epoch(
         num_batches += 1
         global_step += 1
 
+        if node_prefetcher is not None and is_main_process(rank):
+            node_prefetcher.update_progress(batch_idx + 1)
+
         if global_step >= max_steps:
             if is_main_process(rank):
                 logger.info(f"达到最大训练步数 {max_steps}，提前结束当前 epoch")
@@ -1123,13 +1472,16 @@ def main():
             # === 文件日志：同时写入带时间戳的 train_<timestamp>.log ===
             _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             log_file = output_dir / f"train_{_ts}.log"
+            prefetch_detail_log_file = log_dir / f"prefetch_detail_{_ts}.log"
             file_handler = logging.FileHandler(log_file, encoding="utf-8")
             file_handler.setLevel(logging.INFO)
             file_handler.setFormatter(
                 logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
             )
             logging.getLogger().addHandler(file_handler)
+            configure_prefetch_detail_logger(prefetch_detail_log_file)
             logger.info(f"训练日志将同步写入: {log_file}")
+            logger.info(f"预热细节日志将单独写入: {prefetch_detail_log_file}")
         if is_main_process(rank):
             logger.info(f"输出目录: {output_dir}")
             logger.info(f"DDP 模式: {args.ddp_mode}")
@@ -1228,9 +1580,20 @@ def main():
         io_prefetch_warmup_gb = float(io_prefetch_cfg.get("warmup_gb", 0.0))
         if args.io_prefetch_warmup_gb is not None:
             io_prefetch_warmup_gb = float(args.io_prefetch_warmup_gb)
+        io_prefetch_low_watermark_gb = float(
+            io_prefetch_cfg.get("low_watermark_gb", 0.75 * io_prefetch_warmup_gb)
+        )
+        io_prefetch_low_watermark_gb = min(
+            io_prefetch_warmup_gb, max(0.0, io_prefetch_low_watermark_gb)
+        )
         io_prefetch_chunk_mb = int(io_prefetch_cfg.get("read_chunk_mb", 8))
         io_prefetch_threads = int(io_prefetch_cfg.get("prefetch_threads", 1))
         io_prefetch_each_epoch = bool(io_prefetch_cfg.get("warmup_each_epoch", True))
+        io_prefetch_async_refill = bool(io_prefetch_cfg.get("async_refill", True))
+        io_prefetch_scope = str(io_prefetch_cfg.get("scope", "node_union")).strip() or "node_union"
+        io_prefetch_startup_policy = str(
+            io_prefetch_cfg.get("startup_policy", "high_watermark")
+        ).strip() or "high_watermark"
         io_prefetch_max_files = int(io_prefetch_cfg.get("max_files", 0))
         io_prefetch_before_val = bool(io_prefetch_cfg.get("warmup_before_val", True))
         io_prefetch_val_warmup_gb = float(
@@ -1238,6 +1601,12 @@ def main():
         )
         io_prefetch_val_max_files = int(
             io_prefetch_cfg.get("max_files_val", io_prefetch_max_files)
+        )
+        train_node_union_prefetch = bool(
+            io_prefetch_enabled
+            and train_sampler_file_scheduler
+            and io_prefetch_scope == "node_union"
+            and io_prefetch_startup_policy == "high_watermark"
         )
         nan_guard = NaNGuard(nan_guard_cfg, output_dir=output_dir, rank=rank)
 
@@ -1256,7 +1625,11 @@ def main():
             )
             if io_prefetch_enabled:
                 logger.info(
-                    f"I/O 预热窗口: {io_prefetch_warmup_gb:.1f} GiB "
+                    f"I/O 预热窗口: high={io_prefetch_warmup_gb:.1f} GiB, "
+                    f"low={io_prefetch_low_watermark_gb:.1f} GiB, "
+                    f"scope={io_prefetch_scope}, "
+                    f"startup={io_prefetch_startup_policy}, "
+                    f"async_refill={'启用' if io_prefetch_async_refill else '禁用'} "
                     f"(CLI 覆盖: {'是' if args.io_prefetch_warmup_gb is not None else '否'})"
                 )
                 logger.info(
@@ -1368,6 +1741,7 @@ def main():
         max_epochs = max_steps // max(1, len(train_loader)) + 1
 
         final_epoch = start_epoch
+        train_prefetcher: Optional[NodePageCachePrefetcher] = None
         for epoch in range(start_epoch, max_epochs):
             final_epoch = epoch
             if is_main_process(rank):
@@ -1384,22 +1758,74 @@ def main():
             ):
                 train_loader.sampler.set_epoch(epoch)
 
+            if train_prefetcher is not None:
+                train_prefetcher.stop()
+                train_prefetcher = None
+
             if io_prefetch_enabled and (
                 io_prefetch_each_epoch or epoch == start_epoch
             ):
-                if is_main_process(rank):
-                    prefetch_plan = get_prefetch_file_plan(
-                        train_loader,
-                        data_root=data_root,
-                        max_files=io_prefetch_max_files,
-                    )
-                    warmup_hdf5_page_cache(
-                        prefetch_plan,
-                        warmup_gb=io_prefetch_warmup_gb,
-                        read_chunk_mb=io_prefetch_chunk_mb,
-                        max_threads=io_prefetch_threads,
-                    )
-                sync_ranks(world_size, local_rank)
+                if train_node_union_prefetch:
+                    local_rank_schedule = get_prefetch_rank_schedule(train_loader)
+                    if world_size > 1:
+                        gathered_rank_schedules: List[List[Dict[str, Any]]] = [
+                            [] for _ in range(world_size)
+                        ]
+                        dist.all_gather_object(gathered_rank_schedules, local_rank_schedule)
+                    else:
+                        gathered_rank_schedules = [local_rank_schedule]
+
+                    if is_main_process(rank):
+                        plan_counts = [len(items) for items in gathered_rank_schedules]
+                        logger.info(
+                            "文件窗口来源: "
+                            + ", ".join(
+                                f"rank{rank_idx}={count}"
+                                for rank_idx, count in enumerate(plan_counts)
+                            )
+                        )
+                        node_union_plan = build_node_union_prefetch_plan(
+                            gathered_rank_schedules,
+                            data_root=data_root,
+                            max_files=io_prefetch_max_files,
+                        )
+                        unique_files, unique_bytes = _summarize_prefetch_plan_files(
+                            node_union_plan
+                        )
+                        logger.info(
+                            f"节点级联合预热窗口: {len(node_union_plan)} 段 | "
+                            f"唯一文件 {unique_files} 个 | "
+                            f"唯一总大小 {unique_bytes / (1024 ** 3):.2f} GiB | "
+                            f"rank 窗口总数 {sum(plan_counts)}"
+                        )
+                        if node_union_plan:
+                            train_prefetcher = NodePageCachePrefetcher(
+                                node_union_plan,
+                                high_watermark_gb=io_prefetch_warmup_gb,
+                                low_watermark_gb=io_prefetch_low_watermark_gb,
+                                read_chunk_mb=io_prefetch_chunk_mb,
+                                max_threads=io_prefetch_threads,
+                            )
+                            train_prefetcher.warmup_to_high_watermark()
+                            if io_prefetch_async_refill:
+                                train_prefetcher.start_async_refill()
+                        else:
+                            logger.warning("节点级联合预热窗口为空，本 epoch 跳过训练前预热")
+                    sync_ranks(world_size, local_rank)
+                else:
+                    if is_main_process(rank):
+                        prefetch_plan = get_prefetch_file_plan(
+                            train_loader,
+                            data_root=data_root,
+                            max_files=io_prefetch_max_files,
+                        )
+                        warmup_hdf5_page_cache(
+                            prefetch_plan,
+                            warmup_gb=io_prefetch_warmup_gb,
+                            read_chunk_mb=io_prefetch_chunk_mb,
+                            max_threads=io_prefetch_threads,
+                        )
+                    sync_ranks(world_size, local_rank)
 
             train_loss, global_step = train_one_epoch(
                 model,
@@ -1418,7 +1844,12 @@ def main():
                 rank=rank,
                 world_size=world_size,
                 nan_guard=nan_guard,
+                node_prefetcher=train_prefetcher if is_main_process(rank) else None,
             )
+
+            if train_prefetcher is not None:
+                train_prefetcher.stop()
+                train_prefetcher = None
 
             if io_prefetch_enabled and io_prefetch_before_val:
                 if is_main_process(rank):
@@ -1527,6 +1958,8 @@ def main():
         if is_main_process(rank):
             logger.info("训练完成！")
     finally:
+        if 'train_prefetcher' in locals() and train_prefetcher is not None:
+            train_prefetcher.stop()
         if writer is not None:
             writer.close()
         cleanup_distributed()

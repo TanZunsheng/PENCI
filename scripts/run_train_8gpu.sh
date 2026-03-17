@@ -14,10 +14,11 @@
 #   PREFETCH_WARMUP_GB=160 bash scripts/run_train_8gpu.sh
 #   GPU_LIST=0,1,2,3,4,5,6,7 MASTER_PORT=29508 bash scripts/run_train_8gpu.sh
 
-set -uo pipefail
+set -euo pipefail
 
 # ─── 参数透传 ──────────────────────────────────────────────────────────────
-EXTRA_ARGS=("$@")
+RAW_ARGS=("$@")
+PASSTHROUGH_ARGS=()
 
 # ─── 路径与默认参数 ────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,23 +31,28 @@ GPU_LIST="${GPU_LIST:-0,1,2,3,4,5,6,7}"
 MASTER_PORT="${MASTER_PORT:-29508}"
 PREFETCH_WARMUP_GB="${PREFETCH_WARMUP_GB:-120}"
 
-for ((i = 0; i < ${#EXTRA_ARGS[@]}; i++)); do
-    case "${EXTRA_ARGS[$i]}" in
+for ((i = 0; i < ${#RAW_ARGS[@]}; i++)); do
+    case "${RAW_ARGS[$i]}" in
         --config)
-            if ((i + 1 < ${#EXTRA_ARGS[@]})); then
-                CONFIG_PATH="${EXTRA_ARGS[$((i + 1))]}"
+            if ((i + 1 < ${#RAW_ARGS[@]})); then
+                CONFIG_PATH="${RAW_ARGS[$((i + 1))]}"
+                i=$((i + 1))
             fi
             ;;
         --config=*)
-            CONFIG_PATH="${EXTRA_ARGS[$i]#--config=}"
+            CONFIG_PATH="${RAW_ARGS[$i]#--config=}"
             ;;
         --output_dir)
-            if ((i + 1 < ${#EXTRA_ARGS[@]})); then
-                OUTPUT_DIR="${EXTRA_ARGS[$((i + 1))]}"
+            if ((i + 1 < ${#RAW_ARGS[@]})); then
+                OUTPUT_DIR="${RAW_ARGS[$((i + 1))]}"
+                i=$((i + 1))
             fi
             ;;
         --output_dir=*)
-            OUTPUT_DIR="${EXTRA_ARGS[$i]#--output_dir=}"
+            OUTPUT_DIR="${RAW_ARGS[$i]#--output_dir=}"
+            ;;
+        *)
+            PASSTHROUGH_ARGS+=("${RAW_ARGS[$i]}")
             ;;
     esac
 done
@@ -56,6 +62,7 @@ NUM_GPUS=${#GPU_ARRAY[@]}
 TERMINAL_LOG="${OUTPUT_DIR}/terminal_${TIMESTAMP}.log"
 
 mkdir -p "${OUTPUT_DIR}"
+mkdir -p "$(dirname "${TERMINAL_LOG}")"
 
 # ─── 打印启动信息 ──────────────────────────────────────────────────────────
 echo "============================================================"
@@ -63,7 +70,8 @@ echo "  PENCI 8-GPU DDP 训练 (RTX 4090D 稳态版)"
 echo "  时间戳    : ${TIMESTAMP}"
 echo "  输出目录  : ${OUTPUT_DIR}"
 echo "  终端日志  : ${TERMINAL_LOG}"
-echo "  训练日志  : ${OUTPUT_DIR}/train_${TIMESTAMP}.log  (由 train.py 写入)"
+echo "  训练日志  : ${OUTPUT_DIR}/train_*.log  (由 train.py 写入)"
+echo "  预热细节  : ${OUTPUT_DIR}/logs/prefetch_detail_*.log"
 echo "  配置文件  : ${CONFIG_PATH}"
 echo "  GPU       : CUDA_VISIBLE_DEVICES=${GPU_LIST}"
 echo "  进程数    : ${NUM_GPUS}"
@@ -75,7 +83,10 @@ echo "实时查看终端日志:"
 echo "  tail -f ${TERMINAL_LOG}"
 echo ""
 echo "实时查看训练日志:"
-echo "  tail -f ${OUTPUT_DIR}/train_${TIMESTAMP}.log"
+echo "  tail -f ${OUTPUT_DIR}/train_*.log"
+echo ""
+echo "实时查看预热细节日志:"
+echo "  tail -f ${OUTPUT_DIR}/logs/prefetch_detail_*.log"
 echo ""
 
 # ─── 启动训练 ──────────────────────────────────────────────────────────────
@@ -94,7 +105,7 @@ CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
     --output_dir "${OUTPUT_DIR}" \
     --io_prefetch_warmup_gb "${PREFETCH_WARMUP_GB}" \
     --ddp_mode prod \
-    "${EXTRA_ARGS[@]}" \
+    "${PASSTHROUGH_ARGS[@]}" \
     2>&1 | tee "${TERMINAL_LOG}"
 
 EXIT_CODE=${PIPESTATUS[0]}

@@ -63,8 +63,12 @@ data:
     val_shuffle_within_file: false  # 验证阶段文件内顺序采样（更稳定、可复现）
   io_prefetch:
     enabled: true               # 训练前预热 HDF5 到 OS page cache
-    warmup_gb: 100              # 每个 epoch 开始前的预热目标
+    warmup_gb: 100              # 节点级联合预热的高水位目标（GiB）
+    low_watermark_gb: 75        # 训练期后台续热的低水位（GiB）
     warmup_each_epoch: true     # 每个 epoch 都执行预热（配合 epoch 级随机顺序）
+    async_refill: true          # 训练过程中后台单线程续热，维持低/高水位
+    scope: "node_union"        # 预热范围：本节点所有 rank 的并集文件计划
+    startup_policy: "high_watermark"  # 达到高水位后再启动训练
     prefetch_threads: 1         # 预热线程数（NFS 场景建议 1）
     read_chunk_mb: 8            # 顺序读取块大小
     max_files: 0                # >0 时只预热前 N 个文件；0 表示不限制
