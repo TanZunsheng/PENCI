@@ -1,5 +1,5 @@
-# PENCI 默认配置
-# ================
+# PENCI 默认配置（3-GPU 稳妥启动版）
+# ===================================
 
 # 模型配置
 model:
@@ -8,7 +8,7 @@ model:
   n_neuro: 72                   # 源空间脑区数量 (映射到72个脑区)
   n_head: 4                     # 注意力头数量
   dropout: 0.0                  # Dropout 比率
-  
+
   # SEANet 编码器设置
   seanet:
     n_filters: 32               # 基础滤波器数量
@@ -20,7 +20,7 @@ model:
     causal: false               # 是否使用因果卷积
     norm: "weight_norm"         # 归一化类型
     lstm: 2                     # LSTM 层数
-    
+
   # 动力学核心设置
   dynamics:
     type: "transformer"         # 类型: "transformer" 或 "rnn"
@@ -28,7 +28,7 @@ model:
     n_heads: 8                  # 注意力头数量
     dim_feedforward: 1024       # 前馈网络隐藏层维度
     dropout: 0.1                # Dropout 比率
-    
+
   # 物理解码器设置
   physics:
     use_fixed_leadfield: true   # 使用固定物理导联场矩阵 (不通过注意力学习)
@@ -80,7 +80,7 @@ physics:
 # 训练配置
 training:
   # --- 单卡基准参数 (DDP 自动缩放，见下方注释) ---
-  batch_size: 32                # 每卡批次大小 (per-GPU batch size)
+  batch_size: 8                 # 每卡批次大小；关闭 AMP 后先用更稳的显存配置
   num_workers: 1                # 每卡 DataLoader worker；共享 NFS 下低并发更稳
   learning_rate: 5.0e-5         # 单卡基准学习率 (降低以缓解 loss NaN)
   weight_decay: 0.01            # 权重衰减
@@ -92,12 +92,12 @@ training:
   #   warmup_steps 保持不变 (已按全局步数定义)
   #   max_steps 保持不变 (按全局步数计算)
   #   batch_size 为 per-GPU，全局 batch = batch_size * world_size
-  
+
   # 损失函数权重
   loss:
     reconstruction: 1.0         # 传感器空间重建损失权重
     dynamics: 0.1               # 动力学正则化损失权重
-    
+
   # 日志设置
   log_interval: 100             # 日志记录间隔 (步)
   save_interval: 5000           # 模型保存间隔 (步)
@@ -123,7 +123,7 @@ distributed:
 # 硬件配置
 hardware:
   device: "cuda"                # 设备类型: "cuda" 或 "cpu"
-  mixed_precision: true         # 是否使用混合精度训练 (AMP)
+  mixed_precision: false        # 先关闭 AMP，优先验证首个 batch 能否稳定通过
   compile: false                # 是否使用 torch.compile (PyTorch 2.0+)
 
 # 评估配置

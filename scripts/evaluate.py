@@ -230,8 +230,12 @@ def evaluate_sensor_space(
     loss_weights = config.get("training", {}).get("loss", {})
 
     total_pearson = 0.0
-    total_snr = 0.0
-    total_nrmse = 0.0
+    total_snr_sum = 0.0
+    total_snr_count = 0.0
+    total_snr_skipped = 0.0
+    total_nrmse_sum = 0.0
+    total_nrmse_count = 0.0
+    total_nrmse_skipped = 0.0
     total_recon_loss = 0.0
     num_batches = 0
 
@@ -259,8 +263,12 @@ def evaluate_sensor_space(
         recon_loss = F.mse_loss(reconstruction, target)
 
         total_pearson += metrics["pearson"].item()
-        total_snr += metrics["snr_db"].item()
-        total_nrmse += metrics["nrmse"].item()
+        total_snr_sum += metrics["snr_db_sum"].item()
+        total_snr_count += metrics["snr_db_count"].item()
+        total_snr_skipped += metrics["snr_db_skipped"].item()
+        total_nrmse_sum += metrics["nrmse_sum"].item()
+        total_nrmse_count += metrics["nrmse_count"].item()
+        total_nrmse_skipped += metrics["nrmse_skipped"].item()
         total_recon_loss += recon_loss.item()
         num_batches += 1
 
@@ -276,10 +284,16 @@ def evaluate_sensor_space(
         logger.warning("没有可用的评估数据")
         return {"pearson": 0.0, "snr_db": 0.0, "nrmse": 0.0, "recon_loss": 0.0}
 
+    avg_snr = total_snr_sum / total_snr_count if total_snr_count > 0 else float("nan")
+    avg_nrmse = total_nrmse_sum / total_nrmse_count if total_nrmse_count > 0 else float("nan")
     results = {
         "pearson": total_pearson / num_batches,
-        "snr_db": total_snr / num_batches,
-        "nrmse": total_nrmse / num_batches,
+        "snr_db": avg_snr,
+        "snr_db_valid": total_snr_count,
+        "snr_db_skipped": total_snr_skipped,
+        "nrmse": avg_nrmse,
+        "nrmse_valid": total_nrmse_count,
+        "nrmse_skipped": total_nrmse_skipped,
         "recon_loss": total_recon_loss / num_batches,
     }
 
@@ -288,6 +302,19 @@ def evaluate_sensor_space(
     logger.info(f"  SNR:              {results['snr_db']:.2f} dB")
     logger.info(f"  NRMSE:            {results['nrmse']:.4f}")
     logger.info(f"  重建损失 (MSE):   {results['recon_loss']:.6f}")
+    skipped_low_energy = max(
+        int(results["snr_db_skipped"]),
+        int(results["nrmse_skipped"]),
+    )
+    if skipped_low_energy > 0:
+        logger.info(
+            "  低能量通道已跳过: "
+            f"{skipped_low_energy} | "
+            f"SNR有效={int(results['snr_db_valid'])} | "
+            f"NRMSE有效={int(results['nrmse_valid'])}"
+        )
+    if math.isnan(results["snr_db"]) or math.isnan(results["nrmse"]):
+        logger.warning("  评估集中缺少足够的有效信号，SNR/NRMSE 记为 NaN")
 
     return results
 

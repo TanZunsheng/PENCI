@@ -14,11 +14,13 @@ PENCI 训练脚本
 import os
 import sys
 import math
+import time
+import json
 import argparse
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -149,6 +151,361 @@ def reduce_metric(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         tensor /= world_size
     return tensor
+
+
+def reduce_metric_sum(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
+    """在所有 rank 上 all_reduce 一个标量张量并求和"""
+    if world_size > 1:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor
+
+
+def _is_floating_tensor(tensor: Optional[torch.Tensor]) -> bool:
+    return bool(torch.is_tensor(tensor) and (torch.is_floating_point(tensor) or torch.is_complex(tensor)))
+
+
+def _is_finite_tensor(tensor: Optional[torch.Tensor]) -> bool:
+    if tensor is None:
+        return True
+    if not _is_floating_tensor(tensor):
+        return True
+    return bool(torch.isfinite(tensor).all().item())
+
+
+def _tensor_stats(tensor: Optional[torch.Tensor]) -> Dict[str, Any]:
+    """仅在异常路径调用：提取张量统计信息用于 NaN/Inf 诊断。"""
+    if tensor is None:
+        return {"exists": False}
+    if not torch.is_tensor(tensor):
+        return {"exists": False, "type": str(type(tensor))}
+
+    t = tensor.detach()
+    t_cpu = t.to("cpu")
+    stats: Dict[str, Any] = {
+        "exists": True,
+        "shape": list(t_cpu.shape),
+        "dtype": str(t_cpu.dtype),
+        "numel": int(t_cpu.numel()),
+    }
+    if t_cpu.numel() == 0:
+        return stats
+
+    if _is_floating_tensor(t_cpu):
+        finite_mask = torch.isfinite(t_cpu)
+        finite_count = int(finite_mask.sum().item())
+        stats["nan_count"] = int(torch.isnan(t_cpu).sum().item())
+        stats["inf_count"] = int(torch.isinf(t_cpu).sum().item())
+        stats["finite_count"] = finite_count
+        if finite_count > 0:
+            vals = t_cpu[finite_mask].float()
+            stats["min"] = float(vals.min().item())
+            stats["max"] = float(vals.max().item())
+            stats["mean"] = float(vals.mean().item())
+            stats["std"] = float(vals.std(unbiased=False).item())
+        return stats
+
+    # 非浮点数据：主要用于结构确认
+    vals = t_cpu.float()
+    stats["min"] = float(vals.min().item())
+    stats["max"] = float(vals.max().item())
+    stats["mean"] = float(vals.mean().item())
+    return stats
+
+
+def _any_rank_true(local_flag: bool, device: torch.device, world_size: int) -> bool:
+    if world_size <= 1:
+        return local_flag
+    flag_t = torch.tensor(1 if local_flag else 0, device=device, dtype=torch.int32)
+    dist.all_reduce(flag_t, op=dist.ReduceOp.SUM)
+    return bool(flag_t.item() > 0)
+
+
+def _first_non_finite_grad_name(model: nn.Module) -> Optional[str]:
+    base_model = unwrap_model(model)
+    for name, param in base_model.named_parameters():
+        grad = param.grad
+        if grad is None or not _is_floating_tensor(grad):
+            continue
+        if not torch.isfinite(grad).all():
+            return name
+    return None
+
+
+class NaNGuard:
+    """训练时 NaN/Inf 诊断器：记录坏 batch 来源与关键张量统计。"""
+
+    def __init__(self, cfg: Dict[str, Any], output_dir: Path, rank: int):
+        self.enabled = bool(cfg.get("enabled", True))
+        self.fail_fast = bool(cfg.get("fail_fast", True))
+        self.skip_bad_batch = bool(cfg.get("skip_bad_batch", False))
+        self.max_records = max(1, int(cfg.get("max_records", 50)))
+        self.max_metadata_items = max(1, int(cfg.get("max_metadata_items", 128)))
+        self.dump_tensors = bool(cfg.get("dump_tensors", False))
+        self.dump_max_samples = max(1, int(cfg.get("dump_max_samples", 4)))
+        record_stem = str(cfg.get("record_file", "bad_batches")).strip() or "bad_batches"
+        dump_dir_name = str(cfg.get("dump_dir", "bad_batch_tensors")).strip() or "bad_batch_tensors"
+        diagnostics_dir = output_dir / "diagnostics"
+        self.record_path = diagnostics_dir / f"{record_stem}.rank{rank}.jsonl"
+        self.dump_dir = diagnostics_dir / dump_dir_name
+        self.rank = rank
+        self.recorded_count = 0
+
+    def _trim_metadata(self, metadata: Any) -> List[Dict[str, Any]]:
+        if not isinstance(metadata, list):
+            return []
+        trimmed: List[Dict[str, Any]] = []
+        keys = (
+            "dataset",
+            "path",
+            "channels",
+            "fingerprint",
+            "hdf5_path",
+            "hdf5_idx",
+            "sample_index",
+        )
+        for item in metadata[: self.max_metadata_items]:
+            if not isinstance(item, dict):
+                continue
+            row = {k: item.get(k) for k in keys if k in item}
+            trimmed.append(row)
+        return trimmed
+
+    def _dump_tensors(
+        self,
+        *,
+        epoch: int,
+        batch_idx: int,
+        global_step: int,
+        batch: Dict[str, Any],
+        leadfield: Optional[torch.Tensor],
+        output: Optional[Dict[str, torch.Tensor]],
+    ) -> Optional[str]:
+        if not self.dump_tensors:
+            return None
+
+        self.dump_dir.mkdir(parents=True, exist_ok=True)
+        dump_path = self.dump_dir / (
+            f"bad_batch_rank{self.rank}_step{global_step}_epoch{epoch}_idx{batch_idx}.pt"
+        )
+
+        payload = {
+            "x": batch["x"][: self.dump_max_samples].detach().cpu(),
+            "pos": batch["pos"][: self.dump_max_samples].detach().cpu(),
+            "sensor_type": batch["sensor_type"][: self.dump_max_samples].detach().cpu(),
+            "metadata": self._trim_metadata(batch.get("metadata")),
+            "fingerprint": batch.get("fingerprint", "unknown"),
+            "leadfield": None if leadfield is None else leadfield.detach().cpu(),
+        }
+        if isinstance(output, dict):
+            if torch.is_tensor(output.get("reconstruction")):
+                payload["reconstruction"] = (
+                    output["reconstruction"][: self.dump_max_samples].detach().cpu()
+                )
+            if torch.is_tensor(output.get("source_activity")):
+                payload["source_activity"] = (
+                    output["source_activity"][: self.dump_max_samples].detach().cpu()
+                )
+
+        torch.save(payload, dump_path)
+        return str(dump_path)
+
+    def record(
+        self,
+        *,
+        reason: str,
+        stage: str,
+        epoch: int,
+        batch_idx: int,
+        global_step: int,
+        world_size: int,
+        batch: Dict[str, Any],
+        leadfield: Optional[torch.Tensor],
+        output: Optional[Dict[str, torch.Tensor]],
+        losses: Optional[Dict[str, torch.Tensor]],
+        lr: float,
+        scaler: Optional[torch.amp.GradScaler],
+        grad_norm: Optional[float],
+        bad_grad_param: Optional[str],
+    ) -> None:
+        if not self.enabled:
+            return
+        if self.recorded_count >= self.max_records:
+            return
+
+        self.record_path.parent.mkdir(parents=True, exist_ok=True)
+        sample_meta = self._trim_metadata(batch.get("metadata"))
+
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "reason": reason,
+            "stage": stage,
+            "rank": self.rank,
+            "world_size": int(world_size),
+            "epoch": int(epoch),
+            "batch_idx": int(batch_idx),
+            "global_step": int(global_step),
+            "lr": float(lr),
+            "amp_scale": float(scaler.get_scale()) if scaler is not None else None,
+            "grad_norm": grad_norm,
+            "bad_grad_param": bad_grad_param,
+            "fingerprint": batch.get("fingerprint", "unknown"),
+            "batch_size": int(batch["x"].shape[0]) if torch.is_tensor(batch.get("x")) else None,
+            "samples": sample_meta,
+            "stats": {
+                "x": _tensor_stats(batch.get("x")),
+                "pos": _tensor_stats(batch.get("pos")),
+                "sensor_type": _tensor_stats(batch.get("sensor_type")),
+                "leadfield": _tensor_stats(leadfield),
+                "loss": _tensor_stats(None if not losses else losses.get("loss")),
+                "recon_loss": _tensor_stats(None if not losses else losses.get("recon_loss")),
+                "dynamics_loss": _tensor_stats(None if not losses else losses.get("dynamics_loss")),
+                "reconstruction": _tensor_stats(
+                    None if not isinstance(output, dict) else output.get("reconstruction")
+                ),
+                "source_activity": _tensor_stats(
+                    None if not isinstance(output, dict) else output.get("source_activity")
+                ),
+            },
+        }
+        dump_path = self._dump_tensors(
+            epoch=epoch,
+            batch_idx=batch_idx,
+            global_step=global_step,
+            batch=batch,
+            leadfield=leadfield,
+            output=output,
+        )
+        if dump_path is not None:
+            record["tensor_dump"] = dump_path
+
+        with self.record_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        self.recorded_count += 1
+
+
+def _gib_to_bytes(gib: float) -> int:
+    return int(max(0.0, gib) * (1024 ** 3))
+
+
+def _resolve_prefetch_paths(
+    hdf5_paths: List[str],
+    data_root: str,
+) -> List[str]:
+    """把相对 HDF5 路径解析成绝对路径，并去重保序。"""
+    resolved: List[str] = []
+    seen = set()
+    for p in hdf5_paths:
+        if not p:
+            continue
+        abs_path = p if os.path.isabs(p) else os.path.join(data_root, p)
+        if abs_path in seen:
+            continue
+        if os.path.isfile(abs_path):
+            seen.add(abs_path)
+            resolved.append(abs_path)
+    return resolved
+
+
+def get_prefetch_file_plan(
+    dataloader,
+    data_root: str,
+    max_files: int = 0,
+) -> List[str]:
+    """
+    获取当前 epoch 的 HDF5 预热文件列表（绝对路径）。
+
+    优先使用 sampler 暴露的消费顺序计划；若不可用则回退为 metadata 顺序去重。
+    """
+    file_paths: List[str] = []
+    batch_sampler = getattr(dataloader, "batch_sampler", None)
+    if batch_sampler is not None and hasattr(batch_sampler, "get_prefetch_file_plan"):
+        try:
+            file_paths = batch_sampler.get_prefetch_file_plan(max_files=max_files)
+        except Exception as e:
+            logger.warning(f"读取 sampler 预热计划失败，将回退到 metadata 顺序: {e}")
+
+    if not file_paths:
+        dataset = getattr(dataloader, "dataset", None)
+        metadata = getattr(dataset, "metadata", None)
+        if isinstance(metadata, list):
+            for m in metadata:
+                h5p = m.get("hdf5_path")
+                if h5p:
+                    file_paths.append(h5p)
+
+    resolved = _resolve_prefetch_paths(file_paths, data_root)
+    if max_files > 0:
+        return resolved[:max_files]
+    return resolved
+
+
+def warmup_hdf5_page_cache(
+    file_paths: List[str],
+    warmup_gb: float,
+    read_chunk_mb: int = 8,
+    max_threads: int = 1,
+) -> float:
+    """
+    训练前顺序预热 HDF5 到 OS page cache。
+
+    说明:
+        - 默认单线程顺序读取，避免并发随机 I/O 打爆 NFS
+        - 返回值是实际预热的数据量（GiB）
+    """
+    target_bytes = _gib_to_bytes(warmup_gb)
+    if target_bytes <= 0:
+        return 0.0
+    if not file_paths:
+        logger.warning("预热计划为空，跳过 HDF5 预热")
+        return 0.0
+
+    # 目前默认保守策略：强制单线程顺序读，优先稳态 I/O。
+    if max_threads != 1:
+        logger.info(
+            f"HDF5 预热线程数请求为 {max_threads}，为避免 NFS 抖动，当前按 1 线程顺序读取执行"
+        )
+
+    chunk_bytes = max(1, int(read_chunk_mb)) * 1024 * 1024
+    warmed_bytes = 0
+    started_at = time.time()
+
+    logger.info(
+        f"开始 HDF5 预热: 目标 {warmup_gb:.1f} GiB, "
+        f"候选文件 {len(file_paths)} 个, 读取块 {read_chunk_mb} MiB"
+    )
+
+    for i, path in enumerate(file_paths, start=1):
+        if warmed_bytes >= target_bytes:
+            break
+
+        file_size = os.path.getsize(path)
+        try:
+            with open(path, "rb", buffering=0) as f:
+                while True:
+                    buf = f.read(chunk_bytes)
+                    if not buf:
+                        break
+        except OSError as e:
+            logger.warning(f"预热读取失败，跳过文件 {path}: {e}")
+            continue
+
+        warmed_bytes += file_size
+        elapsed = max(1e-6, time.time() - started_at)
+        speed_gib = (warmed_bytes / (1024 ** 3)) / elapsed
+        warmed_gib = warmed_bytes / (1024 ** 3)
+        target_gib = target_bytes / (1024 ** 3)
+        pct = min(100.0, (warmed_bytes / target_bytes) * 100.0)
+        eta_sec = max(0.0, (target_gib - warmed_gib) / max(1e-6, speed_gib))
+        logger.info(
+            f"[预热进度] 文件 {i}/{len(file_paths)} | "
+            f"{warmed_gib:.2f}/{target_gib:.2f} GiB ({pct:.1f}%) | "
+            f"{speed_gib:.2f} GiB/s | ETA {eta_sec/60:.1f} min"
+        )
+
+    warmed_gib = warmed_bytes / (1024 ** 3)
+    logger.info(f"HDF5 预热完成: 已加载 {warmed_gib:.2f} GiB 到 OS page cache")
+    return warmed_gib
 
 
 def load_config(config_path: str) -> dict:
@@ -307,6 +664,7 @@ def train_one_epoch(
     scheduler=None,
     rank: int = 0,
     world_size: int = 1,
+    nan_guard: Optional[NaNGuard] = None,
 ):
     """训练一个 epoch"""
     model.train()
@@ -314,15 +672,28 @@ def train_one_epoch(
     total_recon_loss = 0.0
     total_dynamics_loss = 0.0
     num_batches = 0
+    skipped_batches = 0
 
     loss_weights = config.get("training", {}).get("loss", {})
     log_interval = config.get("training", {}).get("log_interval", 100)
     gradient_clip = config.get("training", {}).get("gradient_clip", 1.0)
+    guard_enabled = bool(nan_guard is not None and nan_guard.enabled)
+    diagnostics_hint = "outputs/.../diagnostics/*.jsonl"
+    if nan_guard is not None:
+        base = nan_guard.record_path.name.split(".rank")[0]
+        diagnostics_hint = str(nan_guard.record_path.parent / f"{base}.rank*.jsonl")
 
     for batch_idx, batch in enumerate(dataloader):
         x = batch["x"].to(device)
         pos = batch["pos"].to(device)
         sensor_type = batch["sensor_type"].to(device)
+        current_batch = {
+            "x": x,
+            "pos": pos,
+            "sensor_type": sensor_type,
+            "metadata": batch.get("metadata", []),
+            "fingerprint": batch.get("fingerprint", "unknown"),
+        }
 
         leadfield = None
         if leadfield_manager is not None and electrode_registry is not None:
@@ -333,8 +704,52 @@ def train_one_epoch(
             )
 
         optimizer.zero_grad(set_to_none=True)
+        current_lr = float(optimizer.param_groups[0]["lr"])
+
+        if guard_enabled:
+            input_issues: List[str] = []
+            if not _is_finite_tensor(x):
+                input_issues.append("x_non_finite")
+            if not _is_finite_tensor(pos):
+                input_issues.append("pos_non_finite")
+            if not _is_finite_tensor(leadfield):
+                input_issues.append("leadfield_non_finite")
+
+            local_bad_input = len(input_issues) > 0
+            any_bad_input = _any_rank_true(local_bad_input, device, world_size)
+            if any_bad_input:
+                if local_bad_input and nan_guard is not None:
+                    nan_guard.record(
+                        reason=",".join(input_issues),
+                        stage="input",
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        global_step=global_step,
+                        world_size=world_size,
+                        batch=current_batch,
+                        leadfield=leadfield,
+                        output=None,
+                        losses=None,
+                        lr=current_lr,
+                        scaler=scaler,
+                        grad_norm=None,
+                        bad_grad_param=None,
+                    )
+                if nan_guard is not None and nan_guard.skip_bad_batch and not nan_guard.fail_fast:
+                    skipped_batches += 1
+                    if is_main_process(rank):
+                        logger.warning(
+                            f"跳过异常 batch (stage=input, epoch={epoch}, batch_idx={batch_idx})"
+                        )
+                    continue
+                raise RuntimeError(
+                    f"检测到非有限输入（epoch={epoch}, batch_idx={batch_idx}）。"
+                    f"请检查 {diagnostics_hint}"
+                )
 
         use_amp = scaler is not None
+        output: Dict[str, torch.Tensor] = {}
+        losses: Dict[str, torch.Tensor] = {}
         with torch.autocast(device_type="cuda", enabled=use_amp):
             # 前向传播必须通过 DDP wrapper，才能触发梯度 all-reduce hook
             output = model(x, pos, sensor_type, leadfield=leadfield, return_source=True)
@@ -347,12 +762,102 @@ def train_one_epoch(
         recon_loss = losses["recon_loss"]
         dynamics_loss = losses["dynamics_loss"]
         optimizer_stepped = False
+        grad_norm_value: Optional[float] = None
+        bad_grad_param: Optional[str] = None
+
+        if guard_enabled:
+            fwd_issues: List[str] = []
+            if not _is_finite_tensor(output.get("reconstruction")):
+                fwd_issues.append("reconstruction_non_finite")
+            if not _is_finite_tensor(output.get("source_activity")):
+                fwd_issues.append("source_activity_non_finite")
+            if not _is_finite_tensor(loss):
+                fwd_issues.append("loss_non_finite")
+            if not _is_finite_tensor(recon_loss):
+                fwd_issues.append("recon_loss_non_finite")
+            if not _is_finite_tensor(dynamics_loss):
+                fwd_issues.append("dynamics_loss_non_finite")
+
+            local_bad_forward = len(fwd_issues) > 0
+            any_bad_forward = _any_rank_true(local_bad_forward, device, world_size)
+            if any_bad_forward:
+                if local_bad_forward and nan_guard is not None:
+                    nan_guard.record(
+                        reason=",".join(fwd_issues),
+                        stage="forward",
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        global_step=global_step,
+                        world_size=world_size,
+                        batch=current_batch,
+                        leadfield=leadfield,
+                        output=output,
+                        losses=losses,
+                        lr=current_lr,
+                        scaler=scaler,
+                        grad_norm=None,
+                        bad_grad_param=None,
+                    )
+                if nan_guard is not None and nan_guard.skip_bad_batch and not nan_guard.fail_fast:
+                    skipped_batches += 1
+                    if is_main_process(rank):
+                        logger.warning(
+                            f"跳过异常 batch (stage=forward, epoch={epoch}, batch_idx={batch_idx})"
+                        )
+                    continue
+                raise RuntimeError(
+                    f"检测到非有限前向输出/损失（epoch={epoch}, batch_idx={batch_idx}）。"
+                    f"请检查 {diagnostics_hint}"
+                )
 
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             if gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                grad_norm_value = float(grad_norm_t.detach().item())
+            elif guard_enabled:
+                grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"))
+                grad_norm_value = float(grad_norm_t.detach().item())
+
+            if guard_enabled:
+                bwd_issues: List[str] = []
+                if grad_norm_value is not None and not math.isfinite(grad_norm_value):
+                    bwd_issues.append("grad_norm_non_finite")
+                    bad_grad_param = _first_non_finite_grad_name(model)
+                local_bad_backward = len(bwd_issues) > 0
+                any_bad_backward = _any_rank_true(local_bad_backward, device, world_size)
+                if any_bad_backward:
+                    if local_bad_backward and nan_guard is not None:
+                        nan_guard.record(
+                            reason=",".join(bwd_issues),
+                            stage="backward",
+                            epoch=epoch,
+                            batch_idx=batch_idx,
+                            global_step=global_step,
+                            world_size=world_size,
+                            batch=current_batch,
+                            leadfield=leadfield,
+                            output=output,
+                            losses=losses,
+                            lr=current_lr,
+                            scaler=scaler,
+                            grad_norm=grad_norm_value,
+                            bad_grad_param=bad_grad_param,
+                        )
+                    optimizer.zero_grad(set_to_none=True)
+                    if nan_guard is not None and nan_guard.skip_bad_batch and not nan_guard.fail_fast:
+                        skipped_batches += 1
+                        if is_main_process(rank):
+                            logger.warning(
+                                f"跳过异常 batch (stage=backward, epoch={epoch}, batch_idx={batch_idx})"
+                            )
+                        continue
+                    raise RuntimeError(
+                        f"检测到非有限梯度（epoch={epoch}, batch_idx={batch_idx}）。"
+                        f"请检查 {diagnostics_hint}"
+                    )
+
             scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
@@ -362,7 +867,50 @@ def train_one_epoch(
         else:
             loss.backward()
             if gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                grad_norm_value = float(grad_norm_t.detach().item())
+            elif guard_enabled:
+                grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"))
+                grad_norm_value = float(grad_norm_t.detach().item())
+
+            if guard_enabled:
+                bwd_issues: List[str] = []
+                if grad_norm_value is not None and not math.isfinite(grad_norm_value):
+                    bwd_issues.append("grad_norm_non_finite")
+                    bad_grad_param = _first_non_finite_grad_name(model)
+                local_bad_backward = len(bwd_issues) > 0
+                any_bad_backward = _any_rank_true(local_bad_backward, device, world_size)
+                if any_bad_backward:
+                    if local_bad_backward and nan_guard is not None:
+                        nan_guard.record(
+                            reason=",".join(bwd_issues),
+                            stage="backward",
+                            epoch=epoch,
+                            batch_idx=batch_idx,
+                            global_step=global_step,
+                            world_size=world_size,
+                            batch=current_batch,
+                            leadfield=leadfield,
+                            output=output,
+                            losses=losses,
+                            lr=current_lr,
+                            scaler=scaler,
+                            grad_norm=grad_norm_value,
+                            bad_grad_param=bad_grad_param,
+                        )
+                    optimizer.zero_grad(set_to_none=True)
+                    if nan_guard is not None and nan_guard.skip_bad_batch and not nan_guard.fail_fast:
+                        skipped_batches += 1
+                        if is_main_process(rank):
+                            logger.warning(
+                                f"跳过异常 batch (stage=backward, epoch={epoch}, batch_idx={batch_idx})"
+                            )
+                        continue
+                    raise RuntimeError(
+                        f"检测到非有限梯度（epoch={epoch}, batch_idx={batch_idx}）。"
+                        f"请检查 {diagnostics_hint}"
+                    )
+
             optimizer.step()
             optimizer_stepped = True
 
@@ -385,11 +933,15 @@ def train_one_epoch(
             dyn_val = dynamics_loss.item()
             # 动力学损失通常极小，用科学计数法显示；较大时回退定点格式
             dyn_fmt = f"{dyn_val:.2e}" if dyn_val < 0.001 else f"{dyn_val:.4f}"
+            gn_str = ""
+            if grad_norm_value is not None and math.isfinite(grad_norm_value):
+                gn_str = f" | GradNorm: {grad_norm_value:.4f}"
             logger.info(
                 f"Epoch {epoch} [{batch_idx}/{len(dataloader)}] "
                 f"Loss: {loss.item():.4f} (avg: {avg_loss:.4f}) "
                 f"Recon: {recon_loss.item():.4f} "
                 f"Dynamics: {dyn_fmt}"
+                f"{gn_str}"
             )
 
             if writer is not None and is_main_process(rank):
@@ -397,8 +949,12 @@ def train_one_epoch(
                 writer.add_scalar("train/recon_loss", recon_loss.item(), global_step)
                 writer.add_scalar("train/dynamics_loss", dynamics_loss.item(), global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+                if grad_norm_value is not None and math.isfinite(grad_norm_value):
+                    writer.add_scalar("train/grad_norm", grad_norm_value, global_step)
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    if skipped_batches > 0 and is_main_process(rank):
+        logger.warning(f"本 epoch 跳过异常 batch 数: {skipped_batches}")
     # 跨 rank 归约训练损失，使 rank 0 记录的是全局平均值
     avg_loss_t = reduce_metric(torch.tensor(avg_loss, device=device), world_size)
     return avg_loss_t.item(), global_step
@@ -420,8 +976,12 @@ def evaluate(
     total_loss = 0.0
     total_recon_loss = 0.0
     total_pearson = 0.0
-    total_snr_db = 0.0
-    total_nrmse = 0.0
+    total_snr_db_sum = 0.0
+    total_snr_db_count = 0.0
+    total_snr_db_skipped = 0.0
+    total_nrmse_sum = 0.0
+    total_nrmse_count = 0.0
+    total_nrmse_skipped = 0.0
     num_batches = 0
 
     loss_weights = config.get("training", {}).get("loss", {})
@@ -451,28 +1011,60 @@ def evaluate(
         total_loss += losses["loss"].item()
         total_recon_loss += losses["recon_loss"].item()
         total_pearson += metrics_batch["pearson"].item()
-        total_snr_db += metrics_batch["snr_db"].item()
-        total_nrmse += metrics_batch["nrmse"].item()
+        total_snr_db_sum += metrics_batch["snr_db_sum"].item()
+        total_snr_db_count += metrics_batch["snr_db_count"].item()
+        total_snr_db_skipped += metrics_batch["snr_db_skipped"].item()
+        total_nrmse_sum += metrics_batch["nrmse_sum"].item()
+        total_nrmse_count += metrics_batch["nrmse_count"].item()
+        total_nrmse_skipped += metrics_batch["nrmse_skipped"].item()
         num_batches += 1
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     avg_recon_loss = total_recon_loss / num_batches if num_batches > 0 else 0.0
     avg_pearson = total_pearson / num_batches if num_batches > 0 else 0.0
-    avg_snr_db = total_snr_db / num_batches if num_batches > 0 else 0.0
-    avg_nrmse = total_nrmse / num_batches if num_batches > 0 else 0.0
 
     avg_loss_t = reduce_metric(torch.tensor(avg_loss, device=device), world_size)
     avg_recon_loss_t = reduce_metric(torch.tensor(avg_recon_loss, device=device), world_size)
     avg_pearson_t = reduce_metric(torch.tensor(avg_pearson, device=device), world_size)
-    avg_snr_db_t = reduce_metric(torch.tensor(avg_snr_db, device=device), world_size)
-    avg_nrmse_t = reduce_metric(torch.tensor(avg_nrmse, device=device), world_size)
+    total_snr_db_sum_t = reduce_metric_sum(
+        torch.tensor(total_snr_db_sum, device=device), world_size
+    )
+    total_snr_db_count_t = reduce_metric_sum(
+        torch.tensor(total_snr_db_count, device=device), world_size
+    )
+    total_snr_db_skipped_t = reduce_metric_sum(
+        torch.tensor(total_snr_db_skipped, device=device), world_size
+    )
+    total_nrmse_sum_t = reduce_metric_sum(
+        torch.tensor(total_nrmse_sum, device=device), world_size
+    )
+    total_nrmse_count_t = reduce_metric_sum(
+        torch.tensor(total_nrmse_count, device=device), world_size
+    )
+    total_nrmse_skipped_t = reduce_metric_sum(
+        torch.tensor(total_nrmse_skipped, device=device), world_size
+    )
+
+    if total_snr_db_count_t.item() > 0:
+        avg_snr_db = total_snr_db_sum_t / total_snr_db_count_t
+    else:
+        avg_snr_db = torch.tensor(float("nan"), device=device)
+
+    if total_nrmse_count_t.item() > 0:
+        avg_nrmse = total_nrmse_sum_t / total_nrmse_count_t
+    else:
+        avg_nrmse = torch.tensor(float("nan"), device=device)
 
     return {
         "loss": avg_loss_t.item(),
         "recon_loss": avg_recon_loss_t.item(),
         "pearson": avg_pearson_t.item(),
-        "snr_db": avg_snr_db_t.item(),
-        "nrmse": avg_nrmse_t.item(),
+        "snr_db": avg_snr_db.item(),
+        "snr_db_valid": total_snr_db_count_t.item(),
+        "snr_db_skipped": total_snr_db_skipped_t.item(),
+        "nrmse": avg_nrmse.item(),
+        "nrmse_valid": total_nrmse_count_t.item(),
+        "nrmse_skipped": total_nrmse_skipped_t.item(),
     }
 
 
@@ -482,6 +1074,12 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="恢复训练的检查点路径")
     parser.add_argument("--output_dir", type=str, default=None, help="输出目录")
     parser.add_argument("--debug", action="store_true", help="调试模式")
+    parser.add_argument(
+        "--io_prefetch_warmup_gb",
+        type=float,
+        default=None,
+        help="覆盖 data.io_prefetch.warmup_gb（GiB）",
+    )
     parser.add_argument(
         "--ddp_mode",
         type=str,
@@ -570,6 +1168,9 @@ def main():
             logger.info("创建数据加载器...")
         data_config = config.get("data", {})
         training_config = config.get("training", {})
+        file_scheduler_cfg = data_config.get("file_scheduler", {})
+        io_prefetch_cfg = data_config.get("io_prefetch", {})
+        nan_guard_cfg = training_config.get("nan_guard", {})
 
         use_bucket_sampler = data_config.get("use_bucket_sampler", False)
         use_fingerprint = False
@@ -586,9 +1187,10 @@ def main():
                 logger.info("动态导联场模式: 自动启用电极指纹分桶")
 
         configured_datasets = data_config.get("datasets", ["HBN_EEG"])
+        data_root = data_config.get("root_dir", "/work/2024/tanzunsheng/PENCIData")
 
         train_loader, val_loader = get_train_val_loaders(
-            data_root=data_config.get("root_dir", "/work/2024/tanzunsheng/PENCIData"),
+            data_root=data_root,
             datasets=configured_datasets,
             batch_size=training_config.get("batch_size", 32),
             num_workers=training_config.get("num_workers", 4),
@@ -596,9 +1198,21 @@ def main():
             use_fingerprint=use_fingerprint,
             max_length=data_config.get("time_window", 10) * data_config.get("sample_rate", 256),
             target_channels=data_config.get("n_channels", 128) if not use_bucket_sampler else None,
+            sampler_file_scheduler=bool(file_scheduler_cfg.get("enabled", False)),
+            sampler_shuffle_within_file=bool(file_scheduler_cfg.get("shuffle_within_file", True)),
             rank=rank,
             world_size=world_size,
         )
+
+        io_prefetch_enabled = bool(io_prefetch_cfg.get("enabled", False))
+        io_prefetch_warmup_gb = float(io_prefetch_cfg.get("warmup_gb", 0.0))
+        if args.io_prefetch_warmup_gb is not None:
+            io_prefetch_warmup_gb = float(args.io_prefetch_warmup_gb)
+        io_prefetch_chunk_mb = int(io_prefetch_cfg.get("read_chunk_mb", 8))
+        io_prefetch_threads = int(io_prefetch_cfg.get("prefetch_threads", 1))
+        io_prefetch_each_epoch = bool(io_prefetch_cfg.get("warmup_each_epoch", True))
+        io_prefetch_max_files = int(io_prefetch_cfg.get("max_files", 0))
+        nan_guard = NaNGuard(nan_guard_cfg, output_dir=output_dir, rank=rank)
 
         if is_main_process(rank):
             logger.info(f"训练集大小: {len(train_loader.dataset)}")
@@ -606,6 +1220,17 @@ def main():
             logger.info(f"BucketBatchSampler: {'启用' if use_bucket_sampler else '禁用'}")
             if use_fingerprint:
                 logger.info("电极指纹分桶: 启用")
+            if io_prefetch_enabled:
+                logger.info(
+                    f"I/O 预热窗口: {io_prefetch_warmup_gb:.1f} GiB "
+                    f"(CLI 覆盖: {'是' if args.io_prefetch_warmup_gb is not None else '否'})"
+                )
+            logger.info(
+                "NaN 诊断: "
+                f"{'启用' if nan_guard.enabled else '禁用'} | "
+                f"fail_fast={nan_guard.fail_fast} | "
+                f"skip_bad_batch={nan_guard.skip_bad_batch}"
+            )
 
         # 已从存档加载时，指纹已完备，无需再扫描 ProcessedData
         if electrode_registry is not None and not registry_from_archive:
@@ -719,6 +1344,23 @@ def main():
             ):
                 train_loader.sampler.set_epoch(epoch)
 
+            if io_prefetch_enabled and (
+                io_prefetch_each_epoch or epoch == start_epoch
+            ):
+                if is_main_process(rank):
+                    prefetch_plan = get_prefetch_file_plan(
+                        train_loader,
+                        data_root=data_root,
+                        max_files=io_prefetch_max_files,
+                    )
+                    warmup_hdf5_page_cache(
+                        prefetch_plan,
+                        warmup_gb=io_prefetch_warmup_gb,
+                        read_chunk_mb=io_prefetch_chunk_mb,
+                        max_threads=io_prefetch_threads,
+                    )
+                sync_ranks(world_size, local_rank)
+
             train_loss, global_step = train_one_epoch(
                 model,
                 train_loader,
@@ -735,6 +1377,7 @@ def main():
                 scheduler=scheduler,
                 rank=rank,
                 world_size=world_size,
+                nan_guard=nan_guard,
             )
 
             val_metrics = evaluate(
@@ -756,6 +1399,19 @@ def main():
                     f"SNR(dB): {val_metrics['snr_db']:.4f}, "
                     f"NRMSE: {val_metrics['nrmse']:.4f}"
                 )
+                skipped_low_energy = max(
+                    int(val_metrics["snr_db_skipped"]),
+                    int(val_metrics["nrmse_skipped"]),
+                )
+                if skipped_low_energy > 0:
+                    logger.info(
+                        "验证指标过滤: 跳过低能量通道 "
+                        f"{skipped_low_energy} 个 | "
+                        f"SNR有效={int(val_metrics['snr_db_valid'])} | "
+                        f"NRMSE有效={int(val_metrics['nrmse_valid'])}"
+                    )
+                if math.isnan(val_metrics["snr_db"]) or math.isnan(val_metrics["nrmse"]):
+                    logger.warning("验证集中缺少足够的有效信号，SNR/NRMSE 记为 NaN")
                 if writer is not None:
                     writer.add_scalar("val/loss", val_metrics["loss"], global_step)
                     writer.add_scalar("val/recon_loss", val_metrics["recon_loss"], global_step)

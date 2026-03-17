@@ -445,6 +445,9 @@ class PENCIDataset(Dataset):
                 "is_eeg": meta.get("is_eeg", True),
                 "is_meg": meta.get("is_meg", False),
                 "fingerprint": fingerprint,
+                "hdf5_path": meta.get("hdf5_path", ""),
+                "hdf5_idx": int(meta.get("hdf5_idx", -1)) if "hdf5_idx" in meta else -1,
+                "sample_index": idx,
             }
         }
 
@@ -460,6 +463,9 @@ class PENCIDataset(Dataset):
                 "dataset": "dummy", "path": "",
                 "channels": c, "is_eeg": True, "is_meg": False,
                 "fingerprint": "unknown",
+                "hdf5_path": "",
+                "hdf5_idx": -1,
+                "sample_index": -1,
             }
         }
 
@@ -596,6 +602,8 @@ class DistributedBucketBatchSampler(Sampler):
         seed: int = 42,
         use_fingerprint: bool = False,
         cluster_by_file: bool = True,
+        file_scheduler: bool = False,
+        shuffle_within_file: bool = True,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -607,6 +615,8 @@ class DistributedBucketBatchSampler(Sampler):
         self.epoch = 0
         self.use_fingerprint = use_fingerprint
         self.cluster_by_file = cluster_by_file
+        self.file_scheduler = file_scheduler
+        self.shuffle_within_file = shuffle_within_file
 
         self.buckets: Dict[Any, List[int]] = defaultdict(list)
         for idx in range(len(dataset)):
@@ -620,38 +630,57 @@ class DistributedBucketBatchSampler(Sampler):
 
         # 预构建 idx → hdf5_path 映射（用于聚簇排序）
         self._idx_to_h5: Dict[int, str] = {}
+        self._idx_to_h5_idx: Dict[int, int] = {}
         if cluster_by_file:
             for idx in range(len(dataset)):
                 meta = dataset.metadata[idx]
                 self._idx_to_h5[idx] = meta.get("hdf5_path", "")
+                self._idx_to_h5_idx[idx] = int(meta.get("hdf5_idx", -1))
+
+        # epoch 级缓存：避免在同一个 epoch 内重复构建 batch 计划
+        self._cached_epoch = -1
+        self._cached_batches: List[List[int]] = []
+        self._cached_file_plan: List[str] = []
 
         self._total_batches = 0
-        total_batch_size = self.num_replicas * self.batch_size
-        for key, indices in sorted(self.buckets.items(), key=lambda x: str(x[0])):
-            if self.drop_last:
-                rem = (total_batch_size - (len(indices) % total_batch_size)) % total_batch_size
-                padded_len = len(indices) + rem
-                n_batches = padded_len // total_batch_size
-            else:
-                rem = (self.num_replicas - (len(indices) % self.num_replicas)) % self.num_replicas
-                rank_len = (len(indices) + rem) // self.num_replicas
-                n_batches = rank_len // self.batch_size
-                if rank_len % self.batch_size > 0:
-                    n_batches += 1
+        self._refresh_cached_plan(epoch=0)
+        self._total_batches = len(self._cached_batches)
 
-            self._total_batches += n_batches
+        if self.rank == 0:
+            total_batch_size = self.num_replicas * self.batch_size
+            for key, indices in sorted(self.buckets.items(), key=lambda x: str(x[0])):
+                if self.drop_last:
+                    rem = (
+                        total_batch_size
+                        - (len(indices) % total_batch_size)
+                    ) % total_batch_size
+                    padded_len = len(indices) + rem
+                    n_batches = padded_len // total_batch_size
+                else:
+                    rem = (
+                        self.num_replicas
+                        - (len(indices) % self.num_replicas)
+                    ) % self.num_replicas
+                    rank_len = (len(indices) + rem) // self.num_replicas
+                    n_batches = rank_len // self.batch_size
+                    if rank_len % self.batch_size > 0:
+                        n_batches += 1
 
-            if self.rank == 0:
                 if use_fingerprint:
                     ch, fp = key
-                    logger.info(f"  桶 [{ch}ch, fp={fp}]: {len(indices)} 样本, {n_batches} batches")
+                    logger.info(f"  桶 [{ch}ch, fp={fp}]: {len(indices)} 样本, 估计 {n_batches} batches")
                 else:
-                    logger.info(f"  桶 [{key} ch]: {len(indices)} 样本, {n_batches} batches")
+                    logger.info(f"  桶 [{key} ch]: {len(indices)} 样本, 估计 {n_batches} batches")
 
         if self.rank == 0 and cluster_by_file:
             n_h5_files = len(set(self._idx_to_h5.values()) - {""})
             if n_h5_files > 0:
                 logger.info(f"  I/O 聚簇优化: 按 {n_h5_files} 个 HDF5 文件聚簇排列")
+        if self.rank == 0 and self.file_scheduler:
+            logger.info(
+                "  文件级调度: 启用（同一 batch 只来自一个 HDF5 文件，"
+                f"文件内{'打乱' if self.shuffle_within_file else '顺序'}采样）"
+            )
 
     def _cluster_shuffle(
         self, indices: List[int], g: torch.Generator
@@ -681,17 +710,115 @@ class DistributedBucketBatchSampler(Sampler):
 
         result = []
         for gk in group_keys:
-            group_indices = groups[gk]
-            # 组内打乱
-            iperm = torch.randperm(len(group_indices), generator=g).tolist()
-            result.extend(group_indices[i] for i in iperm)
+            # 先按 hdf5_idx 排序，优先顺序读取；再根据配置决定是否组内打乱
+            group_indices = sorted(groups[gk], key=lambda i: self._idx_to_h5_idx.get(i, -1))
+            if self.shuffle and self.shuffle_within_file:
+                iperm = torch.randperm(len(group_indices), generator=g).tolist()
+                result.extend(group_indices[i] for i in iperm)
+            else:
+                result.extend(group_indices)
 
         return result
 
-    def __iter__(self) -> Iterator[List[int]]:
-        """生成当前 rank 的 batch 索引列表"""
+    def _build_default_bucket_batches(
+        self,
+        ids_bucket: List[int],
+        g: torch.Generator,
+        total_batch_size: int,
+    ) -> List[List[int]]:
+        """沿用原始分布式分桶逻辑（样本级分配）。"""
+        if self.shuffle:
+            if self.cluster_by_file and self._idx_to_h5:
+                ids_bucket = self._cluster_shuffle(ids_bucket, g)
+            else:
+                perm = torch.randperm(len(ids_bucket), generator=g).tolist()
+                ids_bucket = [ids_bucket[i] for i in perm]
+
+        rank_batches: List[List[int]] = []
+        if self.drop_last:
+            rem = (total_batch_size - (len(ids_bucket) % total_batch_size)) % total_batch_size
+            if rem > 0:
+                ids_bucket.extend(ids_bucket[:rem])
+
+            ids_rank = ids_bucket[self.rank::self.num_replicas]
+            for start in range(0, len(ids_rank), self.batch_size):
+                batch = ids_rank[start:start + self.batch_size]
+                if len(batch) < self.batch_size:
+                    continue
+                rank_batches.append(batch)
+        else:
+            rem = (self.num_replicas - (len(ids_bucket) % self.num_replicas)) % self.num_replicas
+            if rem > 0:
+                ids_bucket.extend(ids_bucket[:rem])
+
+            ids_rank = ids_bucket[self.rank::self.num_replicas]
+            for start in range(0, len(ids_rank), self.batch_size):
+                batch = ids_rank[start:start + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                rank_batches.append(batch)
+
+        return rank_batches
+
+    def _build_file_scheduled_bucket_batches(
+        self,
+        ids_bucket: List[int],
+        g: torch.Generator,
+        total_batch_size: int,
+    ) -> List[List[int]]:
+        """
+        文件级调度：先按 HDF5 文件分组，再把整文件 batch 分配给 rank。
+
+        目的：
+        1. 同一 batch 只来自一个 HDF5 文件
+        2. 降低同一时刻跨 rank 争抢同一文件的概率
+        """
+        groups: Dict[str, List[int]] = defaultdict(list)
+        for idx in ids_bucket:
+            groups[self._idx_to_h5.get(idx, "")].append(idx)
+
+        # 缺少文件信息时退回默认策略
+        if not groups:
+            return self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
+
+        group_keys = sorted(groups.keys())
+        if self.shuffle:
+            gperm = torch.randperm(len(group_keys), generator=g).tolist()
+            group_keys = [group_keys[i] for i in gperm]
+
+        # 文件数过少时，文件级分配会让部分 rank 没有 batch，退回默认策略
+        if len(group_keys) < self.num_replicas:
+            return self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
+
+        rank_batches: List[List[List[int]]] = [[] for _ in range(self.num_replicas)]
+        for file_pos, gk in enumerate(group_keys):
+            owner_rank = file_pos % self.num_replicas
+            file_indices = sorted(groups[gk], key=lambda i: self._idx_to_h5_idx.get(i, -1))
+            if self.shuffle and self.shuffle_within_file:
+                iperm = torch.randperm(len(file_indices), generator=g).tolist()
+                file_indices = [file_indices[i] for i in iperm]
+
+            if self.drop_last:
+                usable = (len(file_indices) // self.batch_size) * self.batch_size
+                file_indices = file_indices[:usable]
+
+            for start in range(0, len(file_indices), self.batch_size):
+                batch = file_indices[start:start + self.batch_size]
+                if len(batch) < self.batch_size:
+                    continue
+                rank_batches[owner_rank].append(batch)
+
+        min_batches = min(len(b) for b in rank_batches)
+        if min_batches <= 0:
+            # 某些小桶可能出现极端不均衡，退回默认策略保证训练不挂
+            return self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
+
+        return rank_batches[self.rank][:min_batches]
+
+    def _build_epoch_batches(self, epoch: int) -> Tuple[List[List[int]], List[str]]:
+        """构建指定 epoch 的 batch 列表和预取文件计划。"""
         g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
+        g.manual_seed(self.seed + epoch)
 
         all_batches: List[List[int]] = []
         total_batch_size = self.num_replicas * self.batch_size
@@ -699,42 +826,19 @@ class DistributedBucketBatchSampler(Sampler):
         for key in sorted(self.buckets.keys(), key=lambda x: str(x)):
             ids_bucket = self.buckets[key].copy()
 
-            if self.shuffle:
-                if self.cluster_by_file and self._idx_to_h5:
-                    ids_bucket = self._cluster_shuffle(ids_bucket, g)
-                else:
-                    perm = torch.randperm(len(ids_bucket), generator=g).tolist()
-                    ids_bucket = [ids_bucket[i] for i in perm]
-
-            if self.drop_last:
-                rem = (total_batch_size - (len(ids_bucket) % total_batch_size)) % total_batch_size
-                if rem > 0:
-                    ids_bucket.extend(ids_bucket[:rem])
-
-                ids_rank = ids_bucket[self.rank::self.num_replicas]
-
-                for start in range(0, len(ids_rank), self.batch_size):
-                    batch = ids_rank[start:start + self.batch_size]
-                    if len(batch) < self.batch_size:
-                        continue
-                    all_batches.append(batch)
+            if self.file_scheduler and self.cluster_by_file and self._idx_to_h5:
+                bucket_batches = self._build_file_scheduled_bucket_batches(
+                    ids_bucket, g, total_batch_size
+                )
             else:
-                rem = (self.num_replicas - (len(ids_bucket) % self.num_replicas)) % self.num_replicas
-                if rem > 0:
-                    ids_bucket.extend(ids_bucket[:rem])
-
-                ids_rank = ids_bucket[self.rank::self.num_replicas]
-                for start in range(0, len(ids_rank), self.batch_size):
-                    batch = ids_rank[start:start + self.batch_size]
-                    if len(batch) < self.batch_size and self.drop_last:
-                        continue
-                    all_batches.append(batch)
+                bucket_batches = self._build_default_bucket_batches(
+                    ids_bucket, g, total_batch_size
+                )
+            all_batches.extend(bucket_batches)
 
         if self.shuffle:
             if self.cluster_by_file:
                 # 按块打乱：保持 I/O 局部性的同时提供训练随机性
-                # 每 chunk_size 个连续 batch 为一块（通常来自同一/相邻受试者），
-                # 块间打乱但块内保持顺序，使 worker 的文件句柄缓存命中率最大化
                 chunk_size = max(1, self.batch_size // 2)
                 chunks = []
                 for i in range(0, len(all_batches), chunk_size):
@@ -747,7 +851,31 @@ class DistributedBucketBatchSampler(Sampler):
                 perm = torch.randperm(len(all_batches), generator=g).tolist()
                 all_batches = [all_batches[i] for i in perm]
 
-        yield from all_batches
+        # 预取计划：按 batch 消费顺序提取去重后的 HDF5 文件序列
+        file_plan: List[str] = []
+        seen: set = set()
+        for batch in all_batches:
+            if not batch:
+                continue
+            h5_path = self._idx_to_h5.get(batch[0], "")
+            if h5_path and h5_path not in seen:
+                seen.add(h5_path)
+                file_plan.append(h5_path)
+
+        return all_batches, file_plan
+
+    def _refresh_cached_plan(self, epoch: int) -> None:
+        if self._cached_epoch == epoch:
+            return
+        batches, file_plan = self._build_epoch_batches(epoch)
+        self._cached_epoch = epoch
+        self._cached_batches = batches
+        self._cached_file_plan = file_plan
+
+    def __iter__(self) -> Iterator[List[int]]:
+        """生成当前 rank 的 batch 索引列表"""
+        self._refresh_cached_plan(self.epoch)
+        yield from self._cached_batches
 
     def __len__(self) -> int:
         return self._total_batches
@@ -755,6 +883,20 @@ class DistributedBucketBatchSampler(Sampler):
     def set_epoch(self, epoch: int) -> None:
         """设置 epoch（用于分布式训练时同步随机种子）"""
         self.epoch = epoch
+        self._refresh_cached_plan(epoch)
+        self._total_batches = len(self._cached_batches)
+
+    def get_prefetch_file_plan(self, max_files: int = 0) -> List[str]:
+        """
+        返回当前 epoch 的 HDF5 预取计划（按消费顺序去重）。
+
+        参数:
+            max_files: >0 时仅返回前 max_files 个文件；<=0 返回全量
+        """
+        self._refresh_cached_plan(self.epoch)
+        if max_files > 0:
+            return self._cached_file_plan[:max_files]
+        return list(self._cached_file_plan)
 
 
 class PENCICollator:
@@ -848,6 +990,8 @@ def create_dataloader(
     if use_fingerprint:
         dataset_kwargs.setdefault("precompute_fingerprints", True)
     dataset_kwargs.setdefault("rank", rank)
+    sampler_file_scheduler = bool(dataset_kwargs.pop("sampler_file_scheduler", False))
+    sampler_shuffle_within_file = bool(dataset_kwargs.pop("sampler_shuffle_within_file", True))
 
     dataset = PENCIDataset(
         metadata_path=metadata_path,
@@ -865,6 +1009,8 @@ def create_dataloader(
             shuffle=shuffle,
             drop_last=True,
             use_fingerprint=use_fingerprint,
+            file_scheduler=sampler_file_scheduler,
+            shuffle_within_file=sampler_shuffle_within_file,
         )
         loader_kwargs = {
             "num_workers": num_workers,
@@ -990,6 +1136,12 @@ def get_train_val_loaders(
         f"验证 {len(all_val_meta)} 样本 (共 {len(datasets)} 个数据集)"
     )
 
+    train_loader_kwargs = dict(dataset_kwargs)
+    val_loader_kwargs = dict(dataset_kwargs)
+    # 文件级调度主要用于训练期 I/O 稳态优化；验证阶段保持默认采样逻辑更稳妥。
+    val_loader_kwargs["sampler_file_scheduler"] = False
+    val_loader_kwargs["sampler_shuffle_within_file"] = False
+
     train_loader = create_dataloader(
         metadata=all_train_meta,
         batch_size=batch_size,
@@ -999,7 +1151,7 @@ def get_train_val_loaders(
         use_fingerprint=use_fingerprint,
         rank=rank,
         world_size=world_size,
-        **dataset_kwargs,
+        **train_loader_kwargs,
     )
 
     val_loader = create_dataloader(
@@ -1011,7 +1163,7 @@ def get_train_val_loaders(
         use_fingerprint=use_fingerprint,
         rank=rank,
         world_size=world_size,
-        **dataset_kwargs,
+        **val_loader_kwargs,
     )
 
     return train_loader, val_loader
