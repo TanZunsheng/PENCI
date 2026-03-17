@@ -59,6 +59,8 @@ data:
   file_scheduler:
     enabled: true               # 文件级调度：同一 batch 仅来自一个 HDF5 文件
     shuffle_within_file: true   # 文件进入缓存后，文件内样本随机打乱再组 batch
+    val_enabled: true           # 验证阶段也启用文件级调度，减少跨文件随机读取
+    val_shuffle_within_file: false  # 验证阶段文件内顺序采样，更稳定也更可复现
   io_prefetch:
     enabled: true               # 训练前预热 HDF5 到 OS page cache
     warmup_gb: 100              # 每个 epoch 开始前的预热目标
@@ -66,6 +68,9 @@ data:
     prefetch_threads: 1         # 预热线程数（NFS 场景建议 1）
     read_chunk_mb: 8            # 顺序读取块大小
     max_files: 0                # >0 时只预热前 N 个文件；0 表示不限制
+    warmup_before_val: true     # 每次验证前也执行预热，降低验证阶段 NFS 抖动
+    # warmup_val_gb: 100        # 如需单独设置验证预热大小可打开；默认继承训练预热大小
+    # max_files_val: 0          # 如需限制验证预热文件数可打开；默认继承训练文件上限
 
 # 物理约束配置
 physics:

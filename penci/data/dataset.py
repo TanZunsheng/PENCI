@@ -790,9 +790,8 @@ class DistributedBucketBatchSampler(Sampler):
         if len(group_keys) < self.num_replicas:
             return self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
 
-        rank_batches: List[List[List[int]]] = [[] for _ in range(self.num_replicas)]
-        for file_pos, gk in enumerate(group_keys):
-            owner_rank = file_pos % self.num_replicas
+        file_batches: List[Tuple[str, List[List[int]]]] = []
+        for gk in group_keys:
             file_indices = sorted(groups[gk], key=lambda i: self._idx_to_h5_idx.get(i, -1))
             if self.shuffle and self.shuffle_within_file:
                 iperm = torch.randperm(len(file_indices), generator=g).tolist()
@@ -802,11 +801,32 @@ class DistributedBucketBatchSampler(Sampler):
                 usable = (len(file_indices) // self.batch_size) * self.batch_size
                 file_indices = file_indices[:usable]
 
+            batches: List[List[int]] = []
             for start in range(0, len(file_indices), self.batch_size):
                 batch = file_indices[start:start + self.batch_size]
                 if len(batch) < self.batch_size:
                     continue
-                rank_batches[owner_rank].append(batch)
+                batches.append(batch)
+
+            if batches:
+                file_batches.append((gk, batches))
+
+        if not file_batches:
+            return self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
+
+        # 按文件可贡献的 batch 数做负载均衡，减少后续 min_batches 截断造成的样本浪费。
+        # 先随机化原始顺序（训练时）再按 batch 数降序稳定排序，可保留同规模文件间的随机性。
+        file_batches.sort(key=lambda item: len(item[1]), reverse=True)
+
+        rank_batches: List[List[List[int]]] = [[] for _ in range(self.num_replicas)]
+        rank_batch_counts = [0] * self.num_replicas
+        for _, batches in file_batches:
+            owner_rank = min(
+                range(self.num_replicas),
+                key=lambda rank_idx: (rank_batch_counts[rank_idx], rank_idx),
+            )
+            rank_batches[owner_rank].extend(batches)
+            rank_batch_counts[owner_rank] += len(batches)
 
         min_batches = min(len(b) for b in rank_batches)
         if min_batches <= 0:
@@ -1136,11 +1156,22 @@ def get_train_val_loaders(
         f"验证 {len(all_val_meta)} 样本 (共 {len(datasets)} 个数据集)"
     )
 
+    # 验证集支持独立的采样调度参数；这些键不应透传给训练集 dataset 构造。
+    val_sampler_file_scheduler = dataset_kwargs.pop("val_sampler_file_scheduler", None)
+    val_sampler_shuffle_within_file = dataset_kwargs.pop(
+        "val_sampler_shuffle_within_file", None
+    )
+
     train_loader_kwargs = dict(dataset_kwargs)
     val_loader_kwargs = dict(dataset_kwargs)
-    # 文件级调度主要用于训练期 I/O 稳态优化；验证阶段保持默认采样逻辑更稳妥。
-    val_loader_kwargs["sampler_file_scheduler"] = False
-    val_loader_kwargs["sampler_shuffle_within_file"] = False
+    if val_sampler_file_scheduler is None:
+        val_sampler_file_scheduler = False
+    if val_sampler_shuffle_within_file is None:
+        val_sampler_shuffle_within_file = False
+    val_loader_kwargs["sampler_file_scheduler"] = bool(val_sampler_file_scheduler)
+    val_loader_kwargs["sampler_shuffle_within_file"] = bool(
+        val_sampler_shuffle_within_file
+    )
 
     train_loader = create_dataloader(
         metadata=all_train_meta,

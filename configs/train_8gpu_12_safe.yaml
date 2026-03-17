@@ -1,0 +1,144 @@
+# PENCI 默认配置（8-GPU 稳态训练版，batch_size=12 / AMP off）
+# ==========================================================
+
+# 模型配置
+model:
+  # 编码器设置（源自 BrainOmni）
+  n_dim: 256                    # 主特征维度，越大表达能力越强，但显存/计算也更高
+  n_neuro: 72                   # 源空间脑区数量，和当前 72 脑区建模设定一致
+  n_head: 4                     # 编码器注意力头数
+  dropout: 0.0                  # 顶层 dropout 比率，这里关闭以减少额外扰动
+
+  # SEANet 编码器设置
+  seanet:
+    n_filters: 32               # SEANet 基础通道数，决定卷积主干宽度
+    ratios: [8, 4, 2]           # 时间维下采样倍率，总下采样倍数为 64
+    kernel_size: 7              # 主卷积核大小
+    residual_kernel_size: 3     # 残差块卷积核大小
+    last_kernel_size: 7         # 最后一层卷积核大小
+    dilation_base: 2            # 膨胀卷积基数
+    causal: false               # 是否使用因果卷积，离线训练通常设为 false
+    norm: "weight_norm"         # 卷积层归一化方式
+    lstm: 2                     # SEANet 尾部 LSTM 层数
+
+  # 动力学核心设置
+  dynamics:
+    type: "transformer"         # 动力学核心类型，这里使用 Transformer
+    n_layers: 4                 # Transformer 层数
+    n_heads: 8                  # Transformer 注意力头数
+    dim_feedforward: 1024       # Transformer 前馈层隐藏维度
+    dropout: 0.1                # 动力学模块 dropout 比率
+
+  # 物理解码器设置
+  physics:
+    use_fixed_leadfield: true   # 使用固定导联场矩阵做物理约束
+    leadfield_path: null        # null 表示运行时按电极指纹动态加载导联场
+
+# 数据配置
+data:
+  root_dir: "/work/2024/tanzunsheng/PENCIData"  # 数据根目录
+  datasets:                                     # 训练/验证使用的数据集列表
+    - "HBN_EEG"
+    - "Brennan_Hale2019"
+    - "Grootswagers2019"
+    - "THINGS-EEG"
+    - "ThingsEEG"
+    - "SEED-DV"
+    - "Broderick2018_NaturalSpeech"
+    - "Broderick2018_NaturalSpeechReverse"
+    - "Broderick2018_SpeechInNoise"
+    - "Broderick2018_CocktailParty"
+  sample_rate: 256              # 采样率（Hz）
+  window_length: 256            # 基础窗口长度（采样点数）
+  n_channels: 128               # 默认通道数配置；动态导联场模式下不用于 padding
+  time_window: 10               # 每个样本时间长度（秒）
+  stride: 5                     # 滑窗步长（秒）
+  use_bucket_sampler: true      # 启用分桶采样，按通道数/指纹组织 batch
+  file_scheduler:
+    enabled: true               # 启用文件级调度，让同一 batch 尽量来自同一个 HDF5 文件
+    shuffle_within_file: true   # 文件内部仍随机采样，兼顾 I/O 局部性和训练随机性
+    val_enabled: true           # 验证阶段也启用文件级调度，减少跨文件随机读取带来的 NFS 抖动
+    val_shuffle_within_file: false  # 验证阶段文件内顺序采样，优先稳定与可复现
+  io_prefetch:
+    enabled: true               # 训练前预热 HDF5 到 OS page cache，减轻训练时段 NFS 压力
+    warmup_gb: 120              # 每个 epoch 前顺序预热的数据量上限（GiB）
+    warmup_each_epoch: true     # 每个 epoch 都重做一次预热，适配 epoch 级随机采样顺序
+    prefetch_threads: 1         # 预热线程数；NFS 场景保持 1 最稳
+    read_chunk_mb: 8            # 顺序读取块大小（MiB）
+    max_files: 0                # 0 表示不限制预热文件数，按 warmup_gb 截止
+    warmup_before_val: true     # 每次验证前也执行预热，降低验证阶段的 NFS 抖动
+    # warmup_val_gb: 120        # 如需单独控制验证预热窗口可打开；默认继承训练预热大小
+    # max_files_val: 0          # 如需限制验证预热文件数可打开；默认继承训练文件上限
+
+# 物理约束配置
+physics:
+  subjects_dir: "/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data"  # fsaverage 相关目录
+  leadfield_cache_dir: "/work/2024/tanzunsheng/leadfield_cache"       # 导联场缓存目录
+  processed_data_dir: "/work/2024/tanzunsheng/ProcessedData"          # 预处理/BIDS 数据目录
+  fingerprint_registry_path: "/work/2024/tanzunsheng/leadfield_cache/fingerprint_registry.pt"  # 离线电极指纹注册表
+
+# 训练配置
+training:
+  # 8 卡时保持 AMP 关闭，先测试每卡 batch=12 的稳定吞吐
+  # train.py 会做线性缩放：effective_lr = learning_rate * world_size
+  # 这里 base_lr=2e-5，在 8 卡时有效学习率约为 1.6e-4，接近 3 卡稳定版
+  batch_size: 12                # 每卡 batch size，8 卡时全局 batch=96
+  num_workers: 1                # 每卡 DataLoader worker 数；先保守，避免 NFS 抖动
+  learning_rate: 2.0e-5         # 单卡基准学习率，训练脚本会按 world_size 做线性缩放
+  weight_decay: 0.01            # AdamW 权重衰减
+  warmup_steps: 2000            # 学习率预热步数
+  max_steps: 120000             # 最大训练总步数（全局步数，不是每卡步数）
+  gradient_clip: 0.5            # 梯度裁剪阈值，防止梯度爆炸
+
+  loss:
+    reconstruction: 1.0         # 传感器空间重建损失权重
+    dynamics: 0.1               # 动力学正则损失权重
+
+  # 8 卡时每一步覆盖样本更多，适当降低验证/存档频率，减少额外 I/O
+  log_interval: 100             # 每多少步打印一次训练日志
+  save_interval: 10000          # 每多少步保存一次 checkpoint
+  eval_interval: 2000           # 每多少步做一次验证
+
+  nan_guard:
+    enabled: true               # 开启 NaN/Inf 诊断
+    fail_fast: true             # 一旦发现异常立即停止，优先保留诊断现场
+    skip_bad_batch: false       # 不跳过坏 batch，先定位根因再决定是否放行
+    max_records: 50             # 每个 rank 最多记录多少条异常
+    max_metadata_items: 128     # 每条异常最多写多少个样本元信息
+    dump_tensors: false         # 是否额外保存坏 batch 的张量快照
+    dump_max_samples: 4         # 若保存快照，每个坏 batch 最多保留前多少个样本
+    record_file: "bad_batches"  # 诊断 JSONL 文件名前缀
+    dump_dir: "bad_batch_tensors"  # 张量快照输出目录名
+
+# 分布式训练配置
+distributed:
+  backend: "nccl"               # 多 GPU 通信后端
+  find_unused_parameters: false # 关闭未使用参数检查，减少 DDP 额外开销
+
+# 硬件配置
+hardware:
+  device: "cuda"                # 使用 CUDA 设备训练
+  mixed_precision: false        # 关闭 AMP；当前项目先以稳定性优先
+  compile: false                # 暂不启用 torch.compile，先减少变量
+
+# 评估配置
+evaluation:
+  sensor_metrics:
+    - "pearson"                 # Pearson 相关系数
+    - "snr_db"                  # 信噪比（dB）
+    - "nrmse"                   # 归一化均方根误差
+  source_comparison:
+    method: "sLORETA"           # 源空间对比所用的传统逆解方法
+    lambda2: 0.1111             # 逆解正则参数（约对应 SNR=3）
+    loose: 0.2                  # 偶极方向松弛度
+    depth: 0.8                  # 深度加权系数
+  simulation:
+    n_trials: 50                # 仿真试验次数
+    n_dipoles: 1                # 每次仿真偶极子数目
+    nave: 20                    # 仿真平均次数，影响仿真噪声水平
+
+# 路径配置
+paths:
+  checkpoint_dir: "checkpoints" # checkpoint 子目录名
+  log_dir: "logs"               # 日志子目录名
+  output_dir: "outputs"         # 输出根目录名

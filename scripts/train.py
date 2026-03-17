@@ -1019,13 +1019,12 @@ def evaluate(
         total_nrmse_skipped += metrics_batch["nrmse_skipped"].item()
         num_batches += 1
 
-    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-    avg_recon_loss = total_recon_loss / num_batches if num_batches > 0 else 0.0
-    avg_pearson = total_pearson / num_batches if num_batches > 0 else 0.0
-
-    avg_loss_t = reduce_metric(torch.tensor(avg_loss, device=device), world_size)
-    avg_recon_loss_t = reduce_metric(torch.tensor(avg_recon_loss, device=device), world_size)
-    avg_pearson_t = reduce_metric(torch.tensor(avg_pearson, device=device), world_size)
+    total_loss_t = reduce_metric_sum(torch.tensor(total_loss, device=device), world_size)
+    total_recon_loss_t = reduce_metric_sum(
+        torch.tensor(total_recon_loss, device=device), world_size
+    )
+    total_pearson_t = reduce_metric_sum(torch.tensor(total_pearson, device=device), world_size)
+    total_num_batches_t = reduce_metric_sum(torch.tensor(num_batches, device=device), world_size)
     total_snr_db_sum_t = reduce_metric_sum(
         torch.tensor(total_snr_db_sum, device=device), world_size
     )
@@ -1054,6 +1053,15 @@ def evaluate(
         avg_nrmse = total_nrmse_sum_t / total_nrmse_count_t
     else:
         avg_nrmse = torch.tensor(float("nan"), device=device)
+
+    if total_num_batches_t.item() > 0:
+        avg_loss_t = total_loss_t / total_num_batches_t
+        avg_recon_loss_t = total_recon_loss_t / total_num_batches_t
+        avg_pearson_t = total_pearson_t / total_num_batches_t
+    else:
+        avg_loss_t = torch.tensor(0.0, device=device)
+        avg_recon_loss_t = torch.tensor(0.0, device=device)
+        avg_pearson_t = torch.tensor(0.0, device=device)
 
     return {
         "loss": avg_loss_t.item(),
@@ -1188,6 +1196,16 @@ def main():
 
         configured_datasets = data_config.get("datasets", ["HBN_EEG"])
         data_root = data_config.get("root_dir", "/work/2024/tanzunsheng/PENCIData")
+        train_sampler_file_scheduler = bool(file_scheduler_cfg.get("enabled", False))
+        train_sampler_shuffle_within_file = bool(
+            file_scheduler_cfg.get("shuffle_within_file", True)
+        )
+        val_sampler_file_scheduler = bool(
+            file_scheduler_cfg.get("val_enabled", train_sampler_file_scheduler)
+        )
+        val_sampler_shuffle_within_file = bool(
+            file_scheduler_cfg.get("val_shuffle_within_file", False)
+        )
 
         train_loader, val_loader = get_train_val_loaders(
             data_root=data_root,
@@ -1198,8 +1216,10 @@ def main():
             use_fingerprint=use_fingerprint,
             max_length=data_config.get("time_window", 10) * data_config.get("sample_rate", 256),
             target_channels=data_config.get("n_channels", 128) if not use_bucket_sampler else None,
-            sampler_file_scheduler=bool(file_scheduler_cfg.get("enabled", False)),
-            sampler_shuffle_within_file=bool(file_scheduler_cfg.get("shuffle_within_file", True)),
+            sampler_file_scheduler=train_sampler_file_scheduler,
+            sampler_shuffle_within_file=train_sampler_shuffle_within_file,
+            val_sampler_file_scheduler=val_sampler_file_scheduler,
+            val_sampler_shuffle_within_file=val_sampler_shuffle_within_file,
             rank=rank,
             world_size=world_size,
         )
@@ -1212,6 +1232,13 @@ def main():
         io_prefetch_threads = int(io_prefetch_cfg.get("prefetch_threads", 1))
         io_prefetch_each_epoch = bool(io_prefetch_cfg.get("warmup_each_epoch", True))
         io_prefetch_max_files = int(io_prefetch_cfg.get("max_files", 0))
+        io_prefetch_before_val = bool(io_prefetch_cfg.get("warmup_before_val", True))
+        io_prefetch_val_warmup_gb = float(
+            io_prefetch_cfg.get("warmup_val_gb", io_prefetch_warmup_gb)
+        )
+        io_prefetch_val_max_files = int(
+            io_prefetch_cfg.get("max_files_val", io_prefetch_max_files)
+        )
         nan_guard = NaNGuard(nan_guard_cfg, output_dir=output_dir, rank=rank)
 
         if is_main_process(rank):
@@ -1220,10 +1247,23 @@ def main():
             logger.info(f"BucketBatchSampler: {'启用' if use_bucket_sampler else '禁用'}")
             if use_fingerprint:
                 logger.info("电极指纹分桶: 启用")
+            logger.info(
+                "文件级调度: "
+                f"训练={'启用' if train_sampler_file_scheduler else '禁用'} "
+                f"(文件内{'打乱' if train_sampler_shuffle_within_file else '顺序'}), "
+                f"验证={'启用' if val_sampler_file_scheduler else '禁用'} "
+                f"(文件内{'打乱' if val_sampler_shuffle_within_file else '顺序'})"
+            )
             if io_prefetch_enabled:
                 logger.info(
                     f"I/O 预热窗口: {io_prefetch_warmup_gb:.1f} GiB "
                     f"(CLI 覆盖: {'是' if args.io_prefetch_warmup_gb is not None else '否'})"
+                )
+                logger.info(
+                    "验证前预热: "
+                    f"{'启用' if io_prefetch_before_val else '禁用'} | "
+                    f"目标 {io_prefetch_val_warmup_gb:.1f} GiB | "
+                    f"max_files={io_prefetch_val_max_files if io_prefetch_val_max_files > 0 else '不限'}"
                 )
             logger.info(
                 "NaN 诊断: "
@@ -1379,6 +1419,21 @@ def main():
                 world_size=world_size,
                 nan_guard=nan_guard,
             )
+
+            if io_prefetch_enabled and io_prefetch_before_val:
+                if is_main_process(rank):
+                    val_prefetch_plan = get_prefetch_file_plan(
+                        val_loader,
+                        data_root=data_root,
+                        max_files=io_prefetch_val_max_files,
+                    )
+                    warmup_hdf5_page_cache(
+                        val_prefetch_plan,
+                        warmup_gb=io_prefetch_val_warmup_gb,
+                        read_chunk_mb=io_prefetch_chunk_mb,
+                        max_threads=io_prefetch_threads,
+                    )
+                sync_ranks(world_size, local_rank)
 
             val_metrics = evaluate(
                 model,
