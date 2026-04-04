@@ -20,10 +20,10 @@ import torch.nn.functional as F
 from einops import rearrange
 from typing import Any, Dict, Optional, Tuple
 
-from penci.encoders.encoder import PENCIEncoder, BrainTokenizerEncoder
+from penci.encoders.encoder import PENCIEncoder
 from penci.encoders.sensor_embed import BrainSensorModule
-from penci.models.dynamics import DynamicsCore, DynamicsRNN
-from penci.models.physics_decoder import PhysicsDecoder
+from penci.shared.models.dynamics import DynamicsCore, DynamicsRNN
+from penci.shared.models.physics_decoder import PhysicsDecoder
 
 
 class PENCI(nn.Module):
@@ -75,7 +75,7 @@ class PENCI(nn.Module):
         ratios: list = None,
         kernel_size: int = 7,
         last_kernel_size: int = 7,
-        window_size: int = 320,
+        window_size: int = 512,
         # 动力学参数
         dynamics_type: str = "transformer",
         dynamics_layers: int = 4,
@@ -468,6 +468,7 @@ def build_penci_from_config(config: Any) -> PENCI:
     # 数据参数
     data_cfg = config.get("data", {}) if hasattr(config, "get") else {}
     n_sensors = data_cfg.get("n_channels", 128)
+    window_size = model_cfg.get("window_size", data_cfg.get("window_length", 512))
     
     return PENCI(
         n_dim=n_dim,
@@ -478,6 +479,7 @@ def build_penci_from_config(config: Any) -> PENCI:
         ratios=ratios,
         kernel_size=kernel_size,
         last_kernel_size=last_kernel_size,
+        window_size=window_size,
         dynamics_type=dynamics_type,
         dynamics_layers=dynamics_layers,
         dynamics_heads=dynamics_heads,
@@ -486,3 +488,25 @@ def build_penci_from_config(config: Any) -> PENCI:
         leadfield_path=leadfield_path,
         n_sensors=n_sensors,
     )
+
+
+def build_stage2_model_from_config(config: Any):
+    """
+    兼容入口：转发到 V1 第二层静态连接模型 builder。
+    """
+    from penci.v1.models.connectivity import (
+        build_stage2_model_from_config as _build_stage2_model_from_config,
+    )
+
+    return _build_stage2_model_from_config(config)
+
+
+def build_stage1_model_from_config(config: Any):
+    """
+    从配置构建 V1 第一层模型。
+    """
+    from penci.models.stage1_model import (
+        build_stage1_model_from_config as _build_stage1_model_from_config,
+    )
+
+    return _build_stage1_model_from_config(config)

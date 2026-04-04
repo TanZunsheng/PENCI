@@ -1,0 +1,1402 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+PENCI Smoke Test
+
+验证模型的前向传播链路是否正常工作。
+不执行真实训练，只验证各组件能否正确连接。
+
+用法:
+    python tests/test_smoke.py
+    
+    # 使用指定的 Python 环境
+    /work/2024/tanzunsheng/anaconda3/envs/EEG/bin/python tests/test_smoke.py
+"""
+
+import sys
+import os
+import time
+import tempfile
+from collections import Counter
+from pathlib import Path
+
+# 添加项目路径
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+import torch
+import torch.nn as nn
+
+
+def test_modules():
+    """测试基础模块"""
+    print("=" * 60)
+    print("测试基础模块")
+    print("=" * 60)
+    
+    from penci.modules.attention import RMSNorm, FeedForward, SelfAttention, RotaryEmbedding
+    from penci.modules.conv import SConv1d
+    from penci.modules.lstm import SLSTM
+    from penci.modules.seanet import SEANetEncoder, Snake1d
+    
+    # 测试 RMSNorm
+    print("\n[1/6] 测试 RMSNorm...")
+    x = torch.randn(2, 10, 256)
+    norm = RMSNorm(256)
+    out = norm(x)
+    assert out.shape == x.shape, f"RMSNorm 输出形状错误: {out.shape}"
+    print(f"  ✓ RMSNorm: {x.shape} -> {out.shape}")
+    
+    # 测试 FeedForward
+    print("\n[2/6] 测试 FeedForward...")
+    ff = FeedForward(256, dropout=0.0)
+    out = ff(x)
+    assert out.shape == x.shape, f"FeedForward 输出形状错误: {out.shape}"
+    print(f"  ✓ FeedForward: {x.shape} -> {out.shape}")
+    
+    # 测试 SConv1d
+    print("\n[3/6] 测试 SConv1d...")
+    x_conv = torch.randn(2, 32, 100)
+    conv = SConv1d(32, 64, kernel_size=3)
+    out = conv(x_conv)
+    print(f"  ✓ SConv1d: {x_conv.shape} -> {out.shape}")
+    
+    # 测试 SLSTM
+    print("\n[4/6] 测试 SLSTM...")
+    x_lstm = torch.randn(2, 64, 20)
+    lstm = SLSTM(64, num_layers=2)
+    out = lstm(x_lstm)
+    print(f"  ✓ SLSTM: {x_lstm.shape} -> {out.shape}")
+    
+    # 测试 Snake1d
+    print("\n[5/6] 测试 Snake1d...")
+    snake = Snake1d(64)
+    x_snake = torch.randn(2, 64, 100)
+    out = snake(x_snake)
+    assert out.shape == x_snake.shape, f"Snake1d 输出形状错误: {out.shape}"
+    print(f"  ✓ Snake1d: {x_snake.shape} -> {out.shape}")
+    
+    # 测试 SEANetEncoder
+    print("\n[6/6] 测试 SEANetEncoder...")
+    encoder = SEANetEncoder(
+        channels=1,
+        dimension=256,
+        n_filters=32,
+        ratios=[8, 4, 2],  # 总下采样 64x
+    )
+    x_enc = torch.randn(2, 1, 320)  # 320 / 64 = 5
+    out = encoder(x_enc)
+    print(f"  ✓ SEANetEncoder: {x_enc.shape} -> {out.shape}")
+    
+    print("\n✓ 所有基础模块测试通过！")
+    return True
+
+
+def test_encoders():
+    """测试编码器模块"""
+    print("\n" + "=" * 60)
+    print("测试编码器模块")
+    print("=" * 60)
+    
+    from penci.encoders import BrainSensorModule, BackWardSolution, PENCIEncoder
+    
+    batch_size = 2
+    n_channels = 128
+    n_dim = 256
+    
+    # 测试 BrainSensorModule
+    print("\n[1/3] 测试 BrainSensorModule...")
+    sensor_module = BrainSensorModule(n_dim)
+    pos = torch.randn(batch_size, n_channels, 6)
+    sensor_type = torch.randint(0, 3, (batch_size, n_channels))
+    out = sensor_module(pos, sensor_type)
+    assert out.shape == (batch_size, n_channels, n_dim), f"形状错误: {out.shape}"
+    print(f"  ✓ BrainSensorModule: pos{pos.shape}, type{sensor_type.shape} -> {out.shape}")
+    
+    # 测试 BackWardSolution
+    print("\n[2/3] 测试 BackWardSolution...")
+    backward = BackWardSolution(n_dim, n_head=4, dropout=0.0)
+    neuros = torch.randn(batch_size, 64, n_dim)  # 64 个源
+    k = torch.randn(batch_size, n_channels, n_dim)
+    x = torch.randn(batch_size, n_channels, n_dim)
+    out = backward(neuros, k, x)
+    assert out.shape == (batch_size, 64, n_dim), f"形状错误: {out.shape}"
+    print(f"  ✓ BackWardSolution: neuros{neuros.shape}, k{k.shape}, x{x.shape} -> {out.shape}")
+    
+    # 测试 PENCIEncoder
+    print("\n[3/3] 测试 PENCIEncoder...")
+    encoder = PENCIEncoder(
+        n_dim=256,
+        n_neuro=72,
+        n_head=4,
+        dropout=0.0,
+        n_filters=32,
+        ratios=[8, 4, 2],
+        window_size=320,
+    )
+    x = torch.randn(batch_size, n_channels, 2560)  # 10 秒 @ 256Hz = 2560 samples
+    pos = torch.randn(batch_size, n_channels, 6)
+    sensor_type = torch.randint(0, 3, (batch_size, n_channels))
+    out = encoder(x, pos, sensor_type)
+    print(f"  ✓ PENCIEncoder: x{x.shape}, pos{pos.shape} -> {out.shape}")
+    
+    print("\n✓ 所有编码器测试通过！")
+    return True
+
+
+def test_dynamics():
+    """测试动力学模块"""
+    print("\n" + "=" * 60)
+    print("测试动力学模块")
+    print("=" * 60)
+    
+    from penci.models.dynamics import DynamicsCore, DynamicsRNN
+    
+    batch_size = 2
+    n_neuro = 72
+    seq_len = 40
+    n_dim = 256
+    
+    # 测试 DynamicsCore (Transformer)
+    print("\n[1/2] 测试 DynamicsCore (Transformer)...")
+    dynamics_tf = DynamicsCore(
+        n_dim=n_dim,
+        n_layers=2,
+        n_heads=4,
+        dim_feedforward=512,
+        dropout=0.1,
+    )
+    x = torch.randn(batch_size, n_neuro, seq_len, n_dim)
+    out = dynamics_tf(x)
+    assert out.shape == x.shape, f"形状错误: {out.shape}"
+    print(f"  ✓ DynamicsCore: {x.shape} -> {out.shape}")
+    
+    # 测试 DynamicsRNN
+    print("\n[2/2] 测试 DynamicsRNN...")
+    dynamics_rnn = DynamicsRNN(
+        n_dim=n_dim,
+        hidden_dim=512,
+        n_layers=2,
+        dropout=0.1,
+    )
+    out = dynamics_rnn(x)
+    assert out.shape == x.shape, f"形状错误: {out.shape}"
+    print(f"  ✓ DynamicsRNN: {x.shape} -> {out.shape}")
+    
+    print("\n✓ 所有动力学模块测试通过！")
+    return True
+
+
+def test_decoder():
+    """测试解码器模块"""
+    print("\n" + "=" * 60)
+    print("测试解码器模块")
+    print("=" * 60)
+    
+    from penci.models.physics_decoder import PhysicsDecoder
+    
+    batch_size = 2
+    n_sensors = 128
+    n_sources = 64
+    seq_len = 40
+    n_dim = 256
+    
+    # 测试 PhysicsDecoder (导联场模式 — 动态传入)
+    print("\n[1/3] 测试 PhysicsDecoder (动态导联场)...")
+    decoder_fixed = PhysicsDecoder(
+        n_dim=n_dim,
+        n_sensors=n_sensors,
+        n_sources=n_sources,
+        use_fixed_leadfield=True,
+    )
+    source_activity = torch.randn(batch_size, n_sources, seq_len, n_dim)
+    leadfield = torch.randn(n_sensors, n_sources)
+    out = decoder_fixed(source_activity, leadfield=leadfield)
+    print(f"  ✓ PhysicsDecoder (共享L): {source_activity.shape} -> {out.shape}")
+    
+    # 测试 per-sample 导联场
+    print("\n[2/3] 测试 PhysicsDecoder (per-sample 导联场)...")
+    leadfield_batch = torch.randn(batch_size, n_sensors, n_sources)
+    out = decoder_fixed(source_activity, leadfield=leadfield_batch)
+    print(f"  ✓ PhysicsDecoder (per-sample L): {source_activity.shape} -> {out.shape}")
+    
+    # 测试 PhysicsDecoder (注意力模式)
+    print("\n[3/3] 测试 PhysicsDecoder (注意力)...")
+    decoder_attn = PhysicsDecoder(
+        n_dim=n_dim,
+        n_sensors=n_sensors,
+        n_sources=n_sources,
+        use_fixed_leadfield=False,
+        n_head=4,
+    )
+    sensor_embedding = torch.randn(batch_size, n_sensors, n_dim)
+    out = decoder_attn(source_activity, sensor_embedding)
+    print(f"  ✓ PhysicsDecoder (attn): source{source_activity.shape}, sensor{sensor_embedding.shape} -> {out.shape}")
+    
+    # 测试无导联场时报错
+    print("\n  验证无导联场 RuntimeError...")
+    try:
+        decoder_fixed(source_activity)
+        assert False, "应该抛出 RuntimeError"
+    except RuntimeError:
+        print("  ✓ 无导联场正确报错")
+    
+    print("\n✓ 所有解码器测试通过！")
+    return True
+
+
+def test_v1_multiscale_encoder():
+    """测试 V1 多尺度编码接口"""
+    print("\n" + "=" * 60)
+    print("测试 V1 多尺度编码接口")
+    print("=" * 60)
+
+    from penci.encoders import PENCIEncoder
+
+    batch_size = 2
+    n_channels = 16
+    seq_len = 640
+
+    encoder = PENCIEncoder(
+        n_dim=64,
+        n_neuro=72,
+        n_head=4,
+        dropout=0.0,
+        n_filters=16,
+        ratios=[8, 4, 2],
+        window_size=320,
+    )
+    x = torch.randn(batch_size, n_channels, seq_len)
+    pos = torch.randn(batch_size, n_channels, 6)
+    sensor_type = torch.randint(0, 3, (batch_size, n_channels))
+
+    output = encoder.encode_multiscale(x, pos, sensor_type)
+    high = output["source_tokens_high"]
+    mid = output["source_tokens_mid"]
+    low = output["source_tokens_low"]
+
+    assert high.dim() == 4 and mid.dim() == 4 and low.dim() == 4
+    assert high.shape[0] == batch_size and high.shape[1] == 72 and high.shape[-1] == 64
+    assert high.shape[2] >= mid.shape[2] >= low.shape[2]
+    assert "window_info" in output and "seanet_info" in output
+    print(f"  ✓ high/mid/low: {high.shape} / {mid.shape} / {low.shape}")
+    return True
+
+
+def test_v1_stage1_model():
+    """测试 V1 第一层模型主路径"""
+    print("\n" + "=" * 60)
+    print("测试 V1 第一层模型")
+    print("=" * 60)
+
+    from penci.models import Stage1Model
+
+    batch_size = 2
+    n_channels = 16
+    seq_len = 640
+
+    model = Stage1Model(
+        n_dim=64,
+        n_neuro=72,
+        n_head=4,
+        dropout=0.0,
+        n_filters=16,
+        ratios=[8, 4, 2],
+        window_size=320,
+        n_sensors=n_channels,
+        state_hidden_dim=32,
+    )
+    x = torch.randn(batch_size, n_channels, seq_len)
+    pos = torch.randn(batch_size, n_channels, 6)
+    sensor_type = torch.randint(0, 3, (batch_size, n_channels))
+    leadfield = torch.randn(n_channels, 72)
+
+    output = model(x, pos, sensor_type, leadfield=leadfield, return_features=True)
+    assert output["source_state"].shape[0] == batch_size
+    assert output["source_state"].shape[1] == 72
+    assert output["reconstruction"].shape == (batch_size, n_channels, seq_len)
+
+    s_true = torch.randn(batch_size, 72, output["source_state"].shape[-1])
+    losses = model.compute_stage1_loss_sim(
+        x,
+        pos,
+        sensor_type,
+        s_true=s_true,
+        leadfield=leadfield,
+    )
+    assert "loss" in losses and "state_supervision_loss" in losses
+    print(
+        f"  ✓ S_t: {output['source_state'].shape}, EEG_hat: {output['reconstruction'].shape}, "
+        f"loss={losses['loss'].item():.4f}"
+    )
+    return True
+
+
+def test_v1_physics_projection_and_connectivity():
+    """测试 V1 物理投影与第二层静态连接模型"""
+    print("\n" + "=" * 60)
+    print("测试 V1 物理投影与第二层连接")
+    print("=" * 60)
+
+    from penci.models import PhysicsDecoder, StaticConnectivityModel, Stage1Model
+
+    batch_size = 2
+    n_sources = 72
+    n_sensors = 16
+    state_len = 32
+
+    decoder = PhysicsDecoder(
+        n_dim=64,
+        n_sensors=n_sensors,
+        n_sources=n_sources,
+        use_fixed_leadfield=True,
+    )
+    leadfield = torch.randn(n_sensors, n_sources)
+    s_t = torch.randn(batch_size, n_sources, state_len)
+
+    y = decoder.project_source_state(s_t, leadfield=leadfield)
+    y_up = decoder.project_source_state_to_sensor(s_t, leadfield=leadfield, target_length=64)
+    assert y.shape == (batch_size, n_sensors, state_len)
+    assert y_up.shape == (batch_size, n_sensors, 64)
+
+    conn = StaticConnectivityModel(n_sources=n_sources, lag_order=2)
+    losses = conn.compute_loss(torch.randn(batch_size, n_sources, 40))
+    losses["loss"].backward()
+    a_base = conn.export_a_base()
+    diag_abs_max = torch.abs(torch.diagonal(a_base)).max().item()
+    assert diag_abs_max < 1e-6, f"A_base 对角线应为 0，当前最大值: {diag_abs_max}"
+    assert conn.a1_raw.grad is not None and conn.a2_raw.grad is not None
+
+    stage1 = Stage1Model(
+        n_dim=32,
+        n_neuro=n_sources,
+        n_head=4,
+        dropout=0.0,
+        n_filters=8,
+        ratios=[8, 4, 2],
+        window_size=320,
+        n_sensors=n_sensors,
+        state_hidden_dim=16,
+    )
+    for param in stage1.parameters():
+        param.requires_grad = False
+
+    x = torch.randn(batch_size, n_sensors, 640)
+    pos = torch.randn(batch_size, n_sensors, 6)
+    sensor_type = torch.randint(0, 3, (batch_size, n_sensors))
+    with torch.no_grad():
+        frozen_s = stage1(
+            x,
+            pos,
+            sensor_type,
+            leadfield=leadfield,
+            return_features=False,
+        )["source_state"].detach()
+    loss_dict = conn.compute_loss(frozen_s)
+    conn.zero_grad(set_to_none=True)
+    loss_dict["loss"].backward()
+    has_stage1_grad = any(p.grad is not None for p in stage1.parameters())
+    assert not has_stage1_grad, "冻结第一层时不应有梯度回传"
+    print(
+        f"  ✓ 物理投影: {y.shape}, 连接损失: {losses['loss'].item():.4f}, "
+        f"A_base 对角线最大值: {diag_abs_max:.2e}"
+    )
+    return True
+
+
+def test_full_model():
+    """测试完整模型"""
+    print("\n" + "=" * 60)
+    print("测试完整 PENCI 模型")
+    print("=" * 60)
+    
+    from penci.models import PENCI, PENCILite
+    
+    batch_size = 2
+    n_channels = 128
+    seq_len = 2560  # 10 秒 @ 256Hz
+    
+    # 准备输入
+    x = torch.randn(batch_size, n_channels, seq_len)
+    pos = torch.randn(batch_size, n_channels, 6)
+    sensor_type = torch.randint(0, 3, (batch_size, n_channels))
+    leadfield = torch.randn(n_channels, 72)
+    
+    # 测试 PENCI
+    print("\n[1/2] 测试 PENCI...")
+    model = PENCI(
+        n_dim=256,
+        n_neuro=72,
+        n_head=4,
+        dropout=0.1,
+        n_filters=32,
+        ratios=[8, 4, 2],
+        dynamics_type="transformer",
+        dynamics_layers=2,
+        dynamics_heads=4,
+        n_sensors=n_channels,
+    )
+    
+    # 打印参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  模型参数量: {total_params:,}")
+    
+    # 前向传播（传入导联场）
+    output = model(x, pos, sensor_type, leadfield=leadfield, return_source=True)
+    print(f"  输入: x{x.shape}, pos{pos.shape}, sensor_type{sensor_type.shape}")
+    print(f"  输出: reconstruction{output['reconstruction'].shape}")
+    print(f"  源活动: source_activity{output['source_activity'].shape}")
+    
+    # 测试损失计算
+    print("\n  测试损失计算...")
+    losses = model.compute_loss(x, pos, sensor_type, leadfield=leadfield)
+    print(f"  总损失: {losses['loss'].item():.4f}")
+    print(f"  重建损失: {losses['recon_loss'].item():.4f}")
+    print(f"  动力学损失: {losses['dynamics_loss'].item():.4f}")
+    
+    # 测试 PENCILite
+    print("\n[2/2] 测试 PENCILite...")
+    model_lite = PENCILite(
+        n_dim=128,
+        n_neuro=32,
+        n_head=4,
+        dropout=0.1,
+        n_filters=16,
+        ratios=[8, 4],
+        dynamics_layers=1,
+        n_sensors=n_channels,
+    )
+    
+    total_params_lite = sum(p.numel() for p in model_lite.parameters())
+    print(f"  模型参数量: {total_params_lite:,}")
+    
+    leadfield_lite = torch.randn(n_channels, 32)
+    output_lite = model_lite(x, pos, sensor_type, leadfield=leadfield_lite)
+    print(f"  输出: reconstruction{output_lite['reconstruction'].shape}")
+    
+    print("\n✓ 完整模型测试通过！")
+    return True
+
+
+def test_data_loading():
+    """测试数据加载"""
+    print("\n" + "=" * 60)
+    print("测试数据加载")
+    print("=" * 60)
+    
+    from penci.data import PENCIDataset, PENCICollator
+    
+    metadata_path = "/work/2024/tanzunsheng/PENCIData/HBN_EEG-metadata/train.json"
+    
+    if not os.path.exists(metadata_path):
+        print(f"  跳过：元数据文件不存在 {metadata_path}")
+        return True
+    
+    print("\n[1/2] 测试 PENCIDataset...")
+    dataset = PENCIDataset(
+        metadata_path,
+        max_length=2560,
+        target_channels=128,
+    )
+    print(f"  数据集大小: {len(dataset)}")
+    
+    # 加载一个样本
+    sample = dataset[0]
+    print(f"  样本 x: {sample['x'].shape}, dtype={sample['x'].dtype}")
+    print(f"  样本 pos: {sample['pos'].shape}")
+    print(f"  样本 sensor_type: {sample['sensor_type'].shape}")
+    
+    print("\n[2/2] 测试 PENCICollator...")
+    collator = PENCICollator()
+    batch = collator([dataset[i] for i in range(min(4, len(dataset)))])
+    print(f"  批次 x: {batch['x'].shape}")
+    print(f"  批次 pos: {batch['pos'].shape}")
+    print(f"  批次 sensor_type: {batch['sensor_type'].shape}")
+    
+    print("\n✓ 数据加载测试通过！")
+    return True
+
+
+def test_integration():
+    """集成测试：数据 -> 模型 -> 损失"""
+    print("\n" + "=" * 60)
+    print("集成测试")
+    print("=" * 60)
+    
+    from penci.models import PENCI
+    from penci.data import PENCIDataset, PENCICollator
+    
+    metadata_path = "/work/2024/tanzunsheng/PENCIData/HBN_EEG-metadata/train.json"
+    
+    if not os.path.exists(metadata_path):
+        print(f"  跳过：元数据文件不存在")
+        # 使用随机数据测试
+        print("  使用随机数据进行测试...")
+        x = torch.randn(4, 128, 2560)
+        pos = torch.randn(4, 128, 6)
+        sensor_type = torch.randint(0, 3, (4, 128))
+    else:
+        print("\n加载真实数据...")
+        dataset = PENCIDataset(metadata_path, max_length=2560, target_channels=128)
+        collator = PENCICollator()
+        batch = collator([dataset[i] for i in range(min(4, len(dataset)))])
+        x = batch['x']
+        pos = batch['pos']
+        sensor_type = batch['sensor_type']
+    
+    print(f"  输入: x{x.shape}, pos{pos.shape}, sensor_type{sensor_type.shape}")
+    
+    n_sensors = x.shape[1]
+    n_neuro = 72
+    leadfield = torch.randn(n_sensors, n_neuro)
+    
+    print("\n创建模型...")
+    model = PENCI(
+        n_dim=256,
+        n_neuro=n_neuro,
+        n_head=4,
+        dropout=0.0,
+        n_filters=32,
+        ratios=[8, 4, 2],
+        dynamics_type="transformer",
+        dynamics_layers=2,
+        n_sensors=n_sensors,
+    )
+    
+    print("\n前向传播...")
+    with torch.no_grad():
+        output = model(x, pos, sensor_type, leadfield=leadfield, return_source=True)
+        losses = model.compute_loss(x, pos, sensor_type, leadfield=leadfield)
+    
+    print(f"  重建输出: {output['reconstruction'].shape}")
+    print(f"  源活动: {output['source_activity'].shape}")
+    print(f"  总损失: {losses['loss'].item():.4f}")
+    
+    print("\n测试反向传播...")
+    model.train()
+    output = model(x, pos, sensor_type, leadfield=leadfield)
+    losses = model.compute_loss(x, pos, sensor_type, leadfield=leadfield)
+    losses['loss'].backward()
+    
+    # 检查梯度
+    has_grad = False
+    for name, param in model.named_parameters():
+        if param.grad is not None and param.grad.abs().sum() > 0:
+            has_grad = True
+            break
+    
+    if has_grad:
+        print("  ✓ 梯度正常流动")
+    else:
+        print("  ✗ 警告：未检测到梯度流动")
+    
+    print("\n✓ 集成测试通过！")
+    return True
+
+
+def test_build_penci_from_config_window_length():
+    """配置中的 data.window_length 应透传到模型 window_size"""
+    from penci.models import build_penci_from_config
+
+    config = {
+        "model": {
+            "n_dim": 128,
+            "n_neuro": 16,
+            "n_head": 4,
+            "dropout": 0.0,
+            "seanet": {
+                "n_filters": 16,
+                "ratios": [8, 4, 2],
+                "kernel_size": 7,
+                "last_kernel_size": 7,
+            },
+            "dynamics": {
+                "type": "transformer",
+                "n_layers": 1,
+                "n_heads": 4,
+                "dim_feedforward": 256,
+            },
+            "physics": {
+                "use_fixed_leadfield": True,
+                "leadfield_path": None,
+            },
+        },
+        "data": {
+            "n_channels": 32,
+            "window_length": 512,
+        },
+    }
+
+    model = build_penci_from_config(config)
+    assert model.window_size == 512
+    assert model.encoder.window_size == 512
+
+
+def test_electrode_utils():
+    """测试电极坐标读取和过滤"""
+    print("\n" + "=" * 60)
+    print("测试电极工具 (electrode_utils)")
+    print("=" * 60)
+
+    import tempfile
+    import numpy as np
+    from penci.physics.electrode_utils import (
+        read_electrodes_tsv,
+        filter_channels_like_postprocess,
+    )
+
+    # === 1. 创建临时 electrodes.tsv 测试文件 ===
+    print("\n[1/4] 测试 read_electrodes_tsv...")
+    tsv_content = (
+        "name\tx\ty\tz\n"
+        "Fp1\t0.0200\t0.0800\t0.0100\n"
+        "Fp2\t-0.0200\t0.0800\t0.0100\n"
+        "Cz\t0.0000\t0.0000\t0.0948\n"
+        "Bad1\tnan\t0.0\t0.0\n"
+        "Bad2\t0.0\t0.0\t0.0\n"
+    )
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix="_electrodes.tsv", delete=False
+    ) as f:
+        f.write(tsv_content)
+        tmp_path = f.name
+
+    try:
+        channels = read_electrodes_tsv(tmp_path)
+        assert len(channels) == 5, f"应读取 5 个通道，实际 {len(channels)}"
+        assert "Fp1" in channels, "缺少 Fp1"
+        assert channels["Fp1"].shape == (3,), f"坐标形状错误: {channels['Fp1'].shape}"
+        print(f"  ✓ 读取 {len(channels)} 个通道")
+
+        # === 2. 测试过滤无效通道 ===
+        print("\n[2/4] 测试 filter_channels_like_postprocess...")
+        valid = filter_channels_like_postprocess(channels, min_valid_channels=1)
+        # Bad1 (NaN) 和 Bad2 (全零) 应被过滤
+        assert "Bad1" not in valid, "Bad1 应被过滤 (NaN)"
+        assert "Bad2" not in valid, "Bad2 应被过滤 (全零)"
+        assert "Fp1" in valid, "Fp1 应保留"
+        assert "Fp2" in valid, "Fp2 应保留"
+        assert "Cz" in valid, "Cz 应保留 (坐标有效)"
+        assert len(valid) == 3, f"应有 3 个有效通道，实际 {len(valid)}"
+        print(f"  ✓ 过滤后 {len(valid)} 个有效通道")
+
+        # === 3. 测试坐标精度 ===
+        print("\n[3/4] 测试坐标精度...")
+        fp1_coord = valid["Fp1"]
+        assert np.allclose(fp1_coord, [0.02, 0.08, 0.01], atol=1e-8), (
+            f"坐标精度错误: {fp1_coord}"
+        )
+        print(f"  ✓ Fp1 坐标正确: {fp1_coord}")
+
+        # === 4. 测试 FileNotFoundError ===
+        print("\n[4/4] 测试文件不存在报错...")
+        try:
+            read_electrodes_tsv("/nonexistent/path/electrodes.tsv")
+            assert False, "应抛出 FileNotFoundError"
+        except FileNotFoundError:
+            print("  ✓ FileNotFoundError 正确抛出")
+    finally:
+        os.unlink(tmp_path)
+
+    print("\n✓ 电极工具测试通过！")
+    return True
+
+
+def test_fingerprint_system():
+    """
+    测试电极指纹系统
+
+    验证 compute_fingerprint_from_pos、ElectrodeConfigRegistry 指纹功能
+    以及 BucketBatchSampler 的指纹分桶逻辑。不依赖外部数据（fsaverage 等）。
+    """
+    print("\n" + "=" * 60)
+    print("测试电极指纹系统")
+    print("=" * 60)
+
+    import numpy as np
+    from penci.physics.leadfield_manager import (
+        _compute_channel_hash,
+        compute_fingerprint_from_pos,
+    )
+    from penci.physics.electrode_utils import ElectrodeConfigRegistry
+
+    # === 1. 测试 compute_fingerprint_from_pos 基本功能 ===
+    print("\n[1/7] 测试 compute_fingerprint_from_pos 基本功能...")
+    pos_a = np.array([[0.02, 0.08, 0.01], [-0.02, 0.08, 0.01], [0.0, 0.0, 0.0948]])
+    fp_a = compute_fingerprint_from_pos(pos_a)
+    assert isinstance(fp_a, str), f"指纹类型错误: {type(fp_a)}"
+    assert len(fp_a) == 16, f"指纹长度错误: {len(fp_a)}（应为 16）"
+    print(f"  ✓ 指纹: {fp_a}（长度 {len(fp_a)}）")
+
+    # === 2. 测试相同坐标产生相同指纹 ===
+    print("\n[2/7] 测试确定性（相同坐标 → 相同指纹）...")
+    fp_a2 = compute_fingerprint_from_pos(pos_a.copy())
+    assert fp_a == fp_a2, f"确定性失败: {fp_a} != {fp_a2}"
+    print(f"  ✓ 相同坐标产生相同指纹")
+
+    # === 3. 测试行顺序无关性 ===
+    print("\n[3/7] 测试行顺序无关性...")
+    pos_a_shuffled = pos_a[[2, 0, 1]]  # 行重排
+    fp_a_shuffled = compute_fingerprint_from_pos(pos_a_shuffled)
+    assert fp_a == fp_a_shuffled, (
+        f"行顺序无关性失败: {fp_a} != {fp_a_shuffled}"
+    )
+    print(f"  ✓ 不同行顺序产生相同指纹")
+
+    # === 4. 测试不同坐标产生不同指纹 ===
+    print("\n[4/7] 测试不同坐标 → 不同指纹...")
+    pos_b = np.array([[0.03, 0.07, 0.02], [-0.03, 0.07, 0.02], [0.0, 0.0, 0.09]])
+    fp_b = compute_fingerprint_from_pos(pos_b)
+    assert fp_a != fp_b, f"不同坐标应产生不同指纹: {fp_a} == {fp_b}"
+    print(f"  ✓ 不同坐标: {fp_a} vs {fp_b}")
+
+    # === 5. 测试 float32/float64 精度一致性 ===
+    print("\n[5/7] 测试 float32/float64 一致性...")
+    pos_f32 = pos_a.astype(np.float32)
+    pos_f64 = pos_a.astype(np.float64)
+    fp_f32 = compute_fingerprint_from_pos(pos_f32)
+    fp_f64 = compute_fingerprint_from_pos(pos_f64)
+    assert fp_f32 == fp_f64, (
+        f"精度不一致: float32={fp_f32} vs float64={fp_f64}"
+    )
+    print(f"  ✓ float32 与 float64 产生相同指纹")
+
+    # === 6. 测试 _compute_channel_hash ===
+    print("\n[6/7] 测试 _compute_channel_hash...")
+    names_a = ["Fp1", "Fp2", "Cz"]
+    full_fp = _compute_channel_hash(names_a, pos_a)
+    assert isinstance(full_fp, str), f"完整指纹类型错误: {type(full_fp)}"
+    assert len(full_fp) == 16, f"完整指纹长度错误: {len(full_fp)}"
+    # 相同输入相同 hash
+    full_fp2 = _compute_channel_hash(names_a, pos_a.copy())
+    assert full_fp == full_fp2, f"完整指纹确定性失败"
+    # 不同通道名 → 不同 hash（即使坐标相同）
+    names_b = ["Fp1", "Fp2", "Oz"]
+    full_fp_b = _compute_channel_hash(names_b, pos_a)
+    assert full_fp != full_fp_b, f"不同通道名应产生不同 hash"
+    print(f"  ✓ 完整指纹: {full_fp}，通道名不同 → 指纹不同")
+
+    # === 7. 测试 ElectrodeConfigRegistry 指纹注册与查询 ===
+    print("\n[7/7] 测试 ElectrodeConfigRegistry 指纹功能...")
+    # 使用一个不存在的目录（不调用 register_dataset，只测试 register_config）
+    registry = ElectrodeConfigRegistry("/tmp/nonexistent_processed_data")
+
+    # 注册配置
+    pos_fp = registry.register_config(names_a, pos_a, dataset_name="TestDataset")
+    assert pos_fp == fp_a, f"注册后的 pos_fp 不匹配: {pos_fp} vs {fp_a}"
+
+    # has_fingerprint
+    assert registry.has_fingerprint(pos_fp), "has_fingerprint 返回 False"
+    assert not registry.has_fingerprint("abcdef1234567890"), "虚假指纹不应存在"
+
+    # get_config_by_fingerprint
+    ret_names, ret_pos = registry.get_config_by_fingerprint(pos_fp)
+    assert ret_names == names_a, f"通道名不匹配: {ret_names}"
+    assert np.array_equal(ret_pos, pos_a), f"坐标不匹配"
+
+    # get_all_fingerprints
+    all_fps = registry.get_all_fingerprints()
+    assert pos_fp in all_fps, f"指纹未在列表中"
+
+    # registered_fingerprints
+    fp_map = registry.registered_fingerprints
+    assert pos_fp in fp_map, "pos_fp 不在映射中"
+    assert fp_map[pos_fp] == full_fp, f"映射值不匹配: {fp_map[pos_fp]} vs {full_fp}"
+
+    # 旧接口兼容
+    ret_names2, ret_pos2 = registry.get_config("TestDataset", 3)
+    assert ret_names2 == names_a, "旧接口通道名不匹配"
+
+    # KeyError 测试
+    try:
+        registry.get_config_by_fingerprint("nonexistent_fingerprint")
+        assert False, "应抛出 KeyError"
+    except KeyError:
+        pass
+
+    print(f"  ✓ Registry: 注册/查询/指纹映射全部正确")
+
+    print("\n✓ 电极指纹系统测试通过！")
+    return True
+
+
+def test_source_space():
+    """
+    测试 SourceSpace (72 个脑区)
+
+    需要 MNE-Python 和 fsaverage 数据。
+    """
+    print("\n" + "=" * 60)
+    print("测试 SourceSpace")
+    print("=" * 60)
+
+    subjects_dir = "/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data"
+    if not os.path.exists(os.path.join(subjects_dir, "fsaverage")):
+        print("  跳过：fsaverage 目录不存在")
+        return True
+
+    import numpy as np
+    from penci.physics.source_space import SourceSpace
+
+    print("\n[1/5] 初始化 SourceSpace...")
+    ss = SourceSpace(subjects_dir=subjects_dir)
+
+    # === 1. 名称数量 ===
+    print("\n[2/5] 验证源数量...")
+    assert len(ss.names) == 72, f"应有 72 个源，实际 {len(ss.names)}"
+    print(f"  ✓ 72 个源: 前3={ss.names[:3]}, 后3={ss.names[-3:]}")
+
+    # === 2. 位置形状 ===
+    print("\n[3/5] 验证位置形状...")
+    assert ss.positions.shape == (72, 3), f"形状错误: {ss.positions.shape}"
+    print(f"  ✓ 位置形状: {ss.positions.shape}")
+
+    # === 3. 皮层 + 皮层下分组 ===
+    print("\n[4/5] 验证皮层/皮层下分组...")
+    assert ss.cortical_positions.shape == (68, 3), (
+        f"皮层源形状错误: {ss.cortical_positions.shape}"
+    )
+    assert ss.subcortical_positions.shape == (4, 3), (
+        f"皮层下源形状错误: {ss.subcortical_positions.shape}"
+    )
+    print(f"  ✓ 68 个皮层源 + 4 个皮层下源")
+
+    # === 4. 坐标范围合理性 ===
+    print("\n[5/5] 验证坐标范围...")
+    pos = ss.positions
+    # MNI 坐标应在合理范围内（米制，约 ±0.1m 即 ±10cm）
+    assert np.abs(pos).max() < 0.2, f"坐标超出合理范围: max={np.abs(pos).max()}"
+    # 不应有 NaN
+    assert not np.isnan(pos).any(), "坐标包含 NaN"
+    print(f"  ✓ 坐标范围: [{pos.min():.4f}, {pos.max():.4f}]")
+
+    print("\n✓ SourceSpace 测试通过！")
+    return True
+
+
+def test_leadfield_e2e():
+    """
+    端到端测试 LeadfieldManager
+
+    需要 MNE-Python、fsaverage 数据和 HBN_EEG 电极坐标。
+    此测试较慢（首次计算约 75 秒），后续从缓存加载很快。
+    """
+    print("\n" + "=" * 60)
+    print("测试 LeadfieldManager (端到端)")
+    print("=" * 60)
+
+    import time
+    import numpy as np
+    from penci.physics.source_space import SourceSpace
+    from penci.physics.leadfield_manager import LeadfieldManager
+    from penci.physics.electrode_utils import get_valid_channels_for_dataset
+
+    subjects_dir = "/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data"
+    processed_dir = "/work/2024/tanzunsheng/ProcessedData"
+    cache_dir = "/work/2024/tanzunsheng/leadfield_cache"
+
+    # 检查前置条件
+    if not os.path.exists(os.path.join(subjects_dir, "fsaverage")):
+        print("  跳过：fsaverage 目录不存在")
+        return True
+
+    # 查找可用的电极坐标文件
+    try:
+        valid_channels, names = get_valid_channels_for_dataset(
+            processed_data_dir=processed_dir,
+            dataset_name="HBN_EEG",
+            subject_id="NDARVA281NVV",
+            site="R11",
+        )
+    except FileNotFoundError:
+        print("  跳过：HBN_EEG 电极坐标文件不存在")
+        return True
+
+    pos = np.array([valid_channels[n] for n in names])
+
+    # === 1. 初始化 ===
+    print(f"\n[1/5] 初始化（{len(names)} 个通道）...")
+    ss = SourceSpace(subjects_dir=subjects_dir)
+    lm = LeadfieldManager(
+        source_space=ss,
+        subjects_dir=subjects_dir,
+        cache_dir=cache_dir,
+    )
+
+    # === 2. 获取导联场 ===
+    print("\n[2/5] 获取导联场...")
+    t0 = time.time()
+    L = lm.get_leadfield(names, pos)
+    elapsed = time.time() - t0
+    print(f"  ✓ 形状: {L.shape}，耗时 {elapsed:.1f}s")
+
+    # 基本验证
+    assert L.shape == (len(names), 72), f"形状错误: {L.shape}"
+    assert L.dtype == torch.float32, f"dtype 错误: {L.dtype}"
+    assert not torch.isnan(L).any(), "导联场包含 NaN"
+    assert not torch.isinf(L).any(), "导联场包含 Inf"
+    assert (L.abs().sum(dim=0) > 0).all(), "存在全零列"
+
+    # === 3. 缓存一致性 ===
+    print("\n[3/5] 验证内存缓存...")
+    t0 = time.time()
+    L_mem = lm.get_leadfield(names, pos)
+    t_mem = time.time() - t0
+    assert torch.equal(L, L_mem), "内存缓存不一致"
+    print(f"  ✓ 内存缓存一致，{t_mem:.4f}s")
+
+    print("\n[4/5] 验证磁盘缓存...")
+    lm2 = LeadfieldManager(
+        source_space=ss, subjects_dir=subjects_dir, cache_dir=cache_dir
+    )
+    t0 = time.time()
+    L_disk = lm2.get_leadfield(names, pos)
+    t_disk = time.time() - t0
+    assert torch.equal(L, L_disk), "磁盘缓存不一致"
+    print(f"  ✓ 磁盘缓存一致，{t_disk:.4f}s")
+
+    # === 4. Batch 接口 ===
+    print("\n[5/5] 验证 Batch 接口...")
+    L_batch = lm.get_leadfield_for_batch(names, pos, batch_size=4)
+    assert L_batch.shape == (4, len(names), 72), f"Batch 形状错误: {L_batch.shape}"
+    assert torch.equal(L_batch[0], L), "Batch 第一个样本不一致"
+    print(f"  ✓ Batch 形状: {L_batch.shape}")
+
+    print("\n✓ LeadfieldManager 端到端测试通过！")
+    return True
+
+
+class _ToyPrefetchDataset:
+    """用于测试文件级预热计划导出的最小数据集。"""
+
+    def __init__(self, metadata):
+        self.metadata = metadata
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def get_channel_count(self, idx):
+        return self.metadata[idx]["channels"]
+
+    def get_fingerprint(self, idx):
+        return self.metadata[idx]["fingerprint"]
+
+
+def _build_expected_rank_schedule(batches, metadata):
+    """根据 batch 的实际消费顺序构造期望的文件窗口计划。"""
+    schedule = []
+    current_path = None
+    current_start = -1
+    current_batches = 0
+
+    def flush():
+        nonlocal current_path, current_start, current_batches
+        if current_path is None or current_batches <= 0:
+            current_path = None
+            current_start = -1
+            current_batches = 0
+            return
+        schedule.append(
+            {
+                "hdf5_path": current_path,
+                "n_batches": current_batches,
+                "first_batch_idx": current_start,
+                "last_batch_idx": current_start + current_batches - 1,
+            }
+        )
+        current_path = None
+        current_start = -1
+        current_batches = 0
+
+    for batch_idx, batch in enumerate(batches):
+        hdf5_path = metadata[batch[0]]["hdf5_path"] if batch else None
+        if hdf5_path != current_path:
+            flush()
+            current_path = hdf5_path
+            current_start = batch_idx
+            current_batches = 1
+        else:
+            current_batches += 1
+    flush()
+    return schedule
+
+
+def test_prefetch_rank_schedule():
+    """测试 DistributedBucketBatchSampler 的 rank 级文件消费计划导出。"""
+    from penci.data.dataset import DistributedBucketBatchSampler
+
+    metadata = [
+        {"channels": 128, "fingerprint": "fp_a", "hdf5_path": "a.h5", "hdf5_idx": 0},
+        {"channels": 128, "fingerprint": "fp_a", "hdf5_path": "a.h5", "hdf5_idx": 1},
+        {"channels": 128, "fingerprint": "fp_a", "hdf5_path": "a.h5", "hdf5_idx": 2},
+        {"channels": 128, "fingerprint": "fp_a", "hdf5_path": "a.h5", "hdf5_idx": 3},
+        {"channels": 128, "fingerprint": "fp_a", "hdf5_path": "b.h5", "hdf5_idx": 0},
+        {"channels": 128, "fingerprint": "fp_a", "hdf5_path": "b.h5", "hdf5_idx": 1},
+        {"channels": 128, "fingerprint": "fp_a", "hdf5_path": "b.h5", "hdf5_idx": 2},
+        {"channels": 128, "fingerprint": "fp_a", "hdf5_path": "b.h5", "hdf5_idx": 3},
+    ]
+    dataset = _ToyPrefetchDataset(metadata)
+    sampler = DistributedBucketBatchSampler(
+        dataset=dataset,
+        batch_size=2,
+        num_replicas=2,
+        rank=0,
+        shuffle=False,
+        drop_last=True,
+        use_fingerprint=True,
+        cluster_by_file=True,
+        file_scheduler=True,
+        shuffle_within_file=False,
+    )
+
+    schedule = sampler.get_prefetch_rank_schedule()
+    assert schedule == [
+        {
+            "hdf5_path": "a.h5",
+            "n_batches": 2,
+            "first_batch_idx": 0,
+            "last_batch_idx": 1,
+        }
+    ], f"rank 级文件计划不匹配: {schedule}"
+    assert sampler.get_prefetch_file_plan() == ["a.h5"]
+
+
+def test_prefetch_rank_schedule_contiguous_file_blocks():
+    """测试 file scheduler 会让同一文件在当前 rank 上连续消费成单窗口。"""
+    from penci.data.dataset import DistributedBucketBatchSampler
+
+    metadata = []
+    for idx in range(40):
+        metadata.append(
+            {"channels": 128, "fingerprint": "fp_a", "hdf5_path": "a.h5", "hdf5_idx": idx}
+        )
+    for idx in range(8):
+        metadata.append(
+            {"channels": 128, "fingerprint": "fp_a", "hdf5_path": "b.h5", "hdf5_idx": idx}
+        )
+    for idx in range(8):
+        metadata.append(
+            {"channels": 128, "fingerprint": "fp_a", "hdf5_path": "c.h5", "hdf5_idx": idx}
+        )
+
+    dataset = _ToyPrefetchDataset(metadata)
+    sampler = DistributedBucketBatchSampler(
+        dataset=dataset,
+        batch_size=2,
+        num_replicas=1,
+        rank=0,
+        shuffle=True,
+        drop_last=True,
+        use_fingerprint=True,
+        cluster_by_file=True,
+        file_scheduler=True,
+        shuffle_within_file=False,
+    )
+    sampler.set_epoch(0)
+
+    batches = list(iter(sampler))
+    expected_schedule = _build_expected_rank_schedule(batches, metadata)
+    schedule = sampler.get_prefetch_rank_schedule()
+    assert schedule == expected_schedule, f"rank 级窗口计划不匹配: {schedule}"
+
+    path_counts = Counter(item["hdf5_path"] for item in schedule)
+    assert path_counts == {"a.h5": 1, "b.h5": 1, "c.h5": 1}, schedule
+
+
+def test_prefetch_rank_schedule_global_file_block_shuffle_across_buckets():
+    """测试文件级调度会在全局文件块层面随机，而不是固定按桶顺序消费。"""
+    from penci.data.dataset import DistributedBucketBatchSampler
+
+    metadata = []
+    for channels, fingerprint, prefix in ((60, "fp_60", "a"), (128, "fp_128", "b")):
+        for file_idx in range(4):
+            hdf5_path = f"{prefix}_{file_idx}.h5"
+            for sample_idx in range(4):
+                metadata.append(
+                    {
+                        "channels": channels,
+                        "fingerprint": fingerprint,
+                        "hdf5_path": hdf5_path,
+                        "hdf5_idx": sample_idx,
+                    }
+                )
+
+    dataset = _ToyPrefetchDataset(metadata)
+    sampler = DistributedBucketBatchSampler(
+        dataset=dataset,
+        batch_size=2,
+        num_replicas=1,
+        rank=0,
+        shuffle=True,
+        drop_last=True,
+        use_fingerprint=True,
+        cluster_by_file=True,
+        file_scheduler=True,
+        shuffle_within_file=False,
+    )
+
+    sampler.set_epoch(0)
+    schedule_epoch0 = sampler.get_prefetch_rank_schedule()
+    sampler.set_epoch(1)
+    schedule_epoch1 = sampler.get_prefetch_rank_schedule()
+
+    paths_epoch0 = [item["hdf5_path"] for item in schedule_epoch0]
+    paths_epoch1 = [item["hdf5_path"] for item in schedule_epoch1]
+    assert paths_epoch0 != paths_epoch1, (paths_epoch0, paths_epoch1)
+    expected_counts = {f"a_{idx}.h5": 1 for idx in range(4)}
+    expected_counts.update({f"b_{idx}.h5": 1 for idx in range(4)})
+    assert Counter(paths_epoch0) == Counter(paths_epoch1) == expected_counts
+
+
+def test_node_union_prefetch_plan():
+    """测试多 rank 文件窗口合并后仍保留同文件的分离窗口。"""
+    from scripts.train import build_node_union_prefetch_plan
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        file_a = base / "a.h5"
+        file_b = base / "b.h5"
+        file_a.write_bytes(b"a" * 128)
+        file_b.write_bytes(b"b" * 256)
+
+        rank_schedules = [
+            [
+                {"hdf5_path": "a.h5", "n_batches": 1, "first_batch_idx": 0, "last_batch_idx": 0},
+                {"hdf5_path": "a.h5", "n_batches": 1, "first_batch_idx": 4, "last_batch_idx": 4},
+            ],
+            [
+                {"hdf5_path": "a.h5", "n_batches": 2, "first_batch_idx": 1, "last_batch_idx": 2},
+                {"hdf5_path": "b.h5", "n_batches": 1, "first_batch_idx": 3, "last_batch_idx": 3},
+                {"hdf5_path": "a.h5", "n_batches": 2, "first_batch_idx": 5, "last_batch_idx": 6},
+            ],
+        ]
+
+        plan = build_node_union_prefetch_plan(rank_schedules, data_root=tmpdir)
+        assert [
+            (item["hdf5_rel"], item["first_use_step"], item["last_use_step"])
+            for item in plan
+        ] == [
+            ("a.h5", 0, 2),
+            ("b.h5", 3, 3),
+            ("a.h5", 4, 6),
+        ], plan
+        assert plan[0]["size_bytes"] == 128
+        assert plan[1]["size_bytes"] == 256
+        assert plan[0]["ranks"] == [0, 1]
+        assert plan[1]["ranks"] == [1]
+        assert plan[2]["ranks"] == [0, 1]
+
+
+def test_node_page_cache_prefetcher_watermarks():
+    """测试节点级 page cache 预取器的高/低水位续热逻辑。"""
+    from scripts.train import NodePageCachePrefetcher
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        file_size = 256 * 1024
+        paths = []
+        for name in ("a.h5", "b.h5", "c.h5"):
+            path = base / name
+            path.write_bytes(b"x" * file_size)
+            paths.append(path)
+
+        plan = [
+            {
+                "hdf5_path": str(paths[0]),
+                "hdf5_rel": "a.h5",
+                "size_bytes": file_size,
+                "first_use_step": 0,
+                "last_use_step": 0,
+                "ranks": [0],
+            },
+            {
+                "hdf5_path": str(paths[1]),
+                "hdf5_rel": "b.h5",
+                "size_bytes": file_size,
+                "first_use_step": 0,
+                "last_use_step": 1,
+                "ranks": [0],
+            },
+            {
+                "hdf5_path": str(paths[2]),
+                "hdf5_rel": "c.h5",
+                "size_bytes": file_size,
+                "first_use_step": 2,
+                "last_use_step": 5,
+                "ranks": [0],
+            },
+        ]
+
+        to_gib = lambda num_bytes: num_bytes / float(1024 ** 3)
+        prefetcher = NodePageCachePrefetcher(
+            plan,
+            high_watermark_gb=to_gib(file_size * 2),
+            low_watermark_gb=to_gib(file_size),
+            read_chunk_mb=1,
+            max_threads=1,
+        )
+        warmed_gib = prefetcher.warmup_to_high_watermark()
+        assert warmed_gib >= to_gib(file_size * 2) - 1e-9
+        assert prefetcher.get_status()["prefetched_cursor"] == 2
+
+        prefetcher.start_async_refill()
+        prefetcher.update_progress(2)
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            status = prefetcher.get_status()
+            if status["prefetched_cursor"] >= 3 and status["active_prefetched_bytes"] >= file_size:
+                break
+            time.sleep(0.05)
+        prefetcher.stop()
+
+        status = prefetcher.get_status()
+        assert status["prefetched_cursor"] >= 3, status
+        assert status["active_prefetched_bytes"] >= file_size, status
+
+
+def test_node_page_cache_prefetcher_dedup_active_bytes():
+    """测试同一文件重复窗口不会重复计入 active working set。"""
+    from scripts.train import NodePageCachePrefetcher
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        file_size = 128 * 1024
+        path_a = base / "a.h5"
+        path_b = base / "b.h5"
+        path_a.write_bytes(b"a" * file_size)
+        path_b.write_bytes(b"b" * file_size)
+
+        plan = [
+            {
+                "hdf5_path": str(path_a),
+                "hdf5_rel": "a.h5",
+                "size_bytes": file_size,
+                "first_use_step": 0,
+                "last_use_step": 0,
+                "ranks": [0],
+            },
+            {
+                "hdf5_path": str(path_a),
+                "hdf5_rel": "a.h5",
+                "size_bytes": file_size,
+                "first_use_step": 5,
+                "last_use_step": 5,
+                "ranks": [0],
+            },
+            {
+                "hdf5_path": str(path_b),
+                "hdf5_rel": "b.h5",
+                "size_bytes": file_size,
+                "first_use_step": 6,
+                "last_use_step": 6,
+                "ranks": [0],
+            },
+        ]
+
+        to_gib = lambda num_bytes: num_bytes / float(1024 ** 3)
+        prefetcher = NodePageCachePrefetcher(
+            plan,
+            high_watermark_gb=to_gib(file_size * 2),
+            low_watermark_gb=to_gib(file_size),
+            read_chunk_mb=1,
+            max_threads=1,
+        )
+        warmed_gib = prefetcher.warmup_to_high_watermark()
+        status = prefetcher.get_status()
+        prefetcher.stop()
+
+        assert warmed_gib >= to_gib(file_size * 2) - 1e-9, warmed_gib
+        assert status["prefetched_cursor"] == 3, status
+        assert status["active_prefetched_bytes"] == file_size * 2, status
+        assert status["active_prefetched_files"] == 2, status
+
+
+
+def test_mainline_namespace_split():
+    """验证 legacy / v1 / shared 命名空间可正常导入并保持兼容导出。"""
+
+    from penci.legacy import PENCI as LegacyPENCI
+    from penci.models import PENCI as CompatPENCI, Stage1Model as CompatStage1Model
+    from penci.shared.models import DynamicsCore as SharedDynamicsCore
+    from penci.shared.models import PhysicsDecoder as SharedPhysicsDecoder
+    from penci.v1 import Stage1Model as V1Stage1Model
+    from penci.v1 import StaticConnectivityModel as V1ConnectivityModel
+
+    assert LegacyPENCI is CompatPENCI
+    assert V1Stage1Model is CompatStage1Model
+    assert SharedDynamicsCore.__name__ == "DynamicsCore"
+    assert SharedPhysicsDecoder.__name__ == "PhysicsDecoder"
+    assert V1ConnectivityModel.__name__ == "StaticConnectivityModel"
+
+def main():
+    """运行所有测试"""
+    print("=" * 60)
+    print("PENCI Smoke Test")
+    print("=" * 60)
+    print(f"Python: {sys.executable}")
+    print(f"PyTorch: {torch.__version__}")
+    print(f"CUDA: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    
+    tests = [
+        ("基础模块", test_modules),
+        ("编码器模块", test_encoders),
+        ("动力学模块", test_dynamics),
+        ("解码器模块", test_decoder),
+        ("V1 多尺度编码", test_v1_multiscale_encoder),
+        ("V1 第一层模型", test_v1_stage1_model),
+        ("V1 物理投影+连接", test_v1_physics_projection_and_connectivity),
+        ("完整模型", test_full_model),
+        ("数据加载", test_data_loading),
+        ("集成测试", test_integration),
+        ("电极工具", test_electrode_utils),
+        ("电极指纹系统", test_fingerprint_system),
+        ("预热计划导出", test_prefetch_rank_schedule),
+        ("预热计划连续块", test_prefetch_rank_schedule_contiguous_file_blocks),
+        ("预热计划全局块随机", test_prefetch_rank_schedule_global_file_block_shuffle_across_buckets),
+        ("节点级预热计划", test_node_union_prefetch_plan),
+        ("节点级续热器", test_node_page_cache_prefetcher_watermarks),
+        ("节点级去重计数", test_node_page_cache_prefetcher_dedup_active_bytes),
+        ("源空间", test_source_space),
+        ("导联场端到端", test_leadfield_e2e),
+        ("主线命名空间拆分", test_mainline_namespace_split),
+    ]
+    
+    results = []
+    for name, test_func in tests:
+        try:
+            success = test_func()
+            results.append((name, success, None))
+        except Exception as e:
+            import traceback
+            results.append((name, False, traceback.format_exc()))
+    
+    # 打印总结
+    print("\n" + "=" * 60)
+    print("测试总结")
+    print("=" * 60)
+    
+    all_passed = True
+    for name, success, error in results:
+        status = "✓ PASS" if success else "✗ FAIL"
+        print(f"  {status}: {name}")
+        if error:
+            print(f"    错误: {error[:200]}...")
+            all_passed = False
+    
+    if all_passed:
+        print("\n" + "=" * 60)
+        print("✓ 所有测试通过！PENCI 模型可以正常工作。")
+        print("=" * 60)
+        return 0
+    else:
+        print("\n" + "=" * 60)
+        print("✗ 部分测试失败，请检查错误信息。")
+        print("=" * 60)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

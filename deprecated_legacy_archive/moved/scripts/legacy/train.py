@@ -29,7 +29,7 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from penci.models import build_penci_from_config
 from penci.data import get_train_val_loaders

@@ -1,0 +1,154 @@
+# PENCI 8-GPU BrainOmni 权重复用对齐版
+# =====================================
+#
+# 目的：
+# 1. 让 PENCI 的 encoder 结构尽可能兼容 BrainOmni / BrainTokenizer 前半段权重
+# 2. 保留 PENCI 自己的 72 源空间 + 动力学核心 + 固定导联场物理解码器
+#
+# 说明：
+# - 本配置文件只负责“参数对齐”，不会自动加载 BrainOmni 权重
+# - 如果后续做部分权重加载，通常应跳过 encoder.neuros（BrainOmni 常见为 16，PENCI 保持 72）
+# - 训练超参大体沿用当前验证过较稳定的 8 卡 safe 配置，避免一次改太多变量
+
+# 模型配置
+model:
+  # 编码器设置（尽量对齐 BrainOmni BrainTokenizer）
+  n_dim: 256                    # BrainOmni: 256
+  n_neuro: 72                   # PENCI 目标保持 72；部分加载权重时通常跳过 encoder.neuros
+  n_head: 4                     # BrainOmni: 4
+  dropout: 0.0                  # BrainOmni tokenizer 顶层 dropout=0.0
+  window_size: 512              # 显式对齐 BrainOmni: 2s @ 256Hz = 512 samples
+
+  # SEANet 编码器设置（与 BrainOmni tokenizer 对齐的关键项）
+  seanet:
+    n_filters: 32               # BrainOmni: 32
+    ratios: [8, 4, 2]           # BrainOmni: [8, 4, 2]
+    kernel_size: 5              # BrainOmni: 5
+    residual_kernel_size: 3     # 保持默认；当前 builder 未显式使用该项
+    last_kernel_size: 5         # BrainOmni: 5
+    dilation_base: 2            # 保持默认；当前 builder 未显式使用该项
+    causal: false               # 保持默认；当前 builder 未显式使用该项
+    norm: "weight_norm"         # 保持默认；当前 builder 未显式使用该项
+    lstm: 2                     # 保持默认；当前 builder 未显式使用该项
+
+  # 动力学核心设置（PENCI 原创部分，不要求与 BrainOmni 对齐）
+  dynamics:
+    type: "transformer"
+    n_layers: 4
+    n_heads: 8
+    dim_feedforward: 1024
+    dropout: 0.1
+
+  # 物理解码器设置（保留 PENCI 物理约束）
+  physics:
+    use_fixed_leadfield: true
+    leadfield_path: null
+
+# 数据配置
+data:
+  root_dir: "/work/2024/tanzunsheng/PENCIData"
+  datasets:
+    - "HBN_EEG"
+    - "Brennan_Hale2019"
+    - "Grootswagers2019"
+    - "THINGS-EEG"
+    - "ThingsEEG"
+    - "SEED-DV"
+    - "Broderick2018_NaturalSpeech"
+    - "Broderick2018_NaturalSpeechReverse"
+    - "Broderick2018_SpeechInNoise"
+    - "Broderick2018_CocktailParty"
+  sample_rate: 256
+  window_length: 512            # 与 model.window_size 保持一致，2 秒窗
+  n_channels: 128
+  time_window: 10
+  stride: 5
+  use_bucket_sampler: true
+  file_scheduler:
+    enabled: true
+    shuffle_within_file: true
+    val_enabled: true
+    val_shuffle_within_file: false
+  io_prefetch:
+    enabled: true
+    warmup_gb: 120
+    low_watermark_gb: 90
+    warmup_each_epoch: true
+    async_refill: true
+    scope: "node_union"
+    startup_policy: "high_watermark"
+    prefetch_threads: 1
+    read_chunk_mb: 8
+    max_files: 0
+    warmup_before_val: true
+
+# 物理约束配置
+physics:
+  subjects_dir: "/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data"
+  leadfield_cache_dir: "/work/2024/tanzunsheng/leadfield_cache"
+  processed_data_dir: "/work/2024/tanzunsheng/ProcessedData"
+  fingerprint_registry_path: "/work/2024/tanzunsheng/leadfield_cache/fingerprint_registry.pt"
+
+# 训练配置
+training:
+  # 仍沿用 8 卡稳态配置；若后续从 BrainOmni encoder 权重初始化，
+  # 可以再单独评估是否进一步降低学习率
+  batch_size: 12
+  num_workers: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_steps: 2000
+  max_steps: 120000
+  gradient_clip: 0.5
+
+  loss:
+    reconstruction: 1.0
+    dynamics: 0.1
+
+  log_interval: 100
+  save_interval: 10000
+  eval_interval: 2000
+
+  nan_guard:
+    enabled: true
+    fail_fast: true
+    skip_bad_batch: false
+    max_records: 50
+    max_metadata_items: 128
+    dump_tensors: false
+    dump_max_samples: 4
+    record_file: "bad_batches"
+    dump_dir: "bad_batch_tensors"
+
+# 分布式训练配置
+distributed:
+  backend: "nccl"
+  find_unused_parameters: false
+
+# 硬件配置
+hardware:
+  device: "cuda"
+  mixed_precision: false
+  compile: false
+
+# 评估配置
+evaluation:
+  sensor_metrics:
+    - "pearson"
+    - "snr_db"
+    - "nrmse"
+  source_comparison:
+    method: "sLORETA"
+    lambda2: 0.1111
+    loose: 0.2
+    depth: 0.8
+  simulation:
+    n_trials: 50
+    n_dipoles: 1
+    nave: 20
+
+# 路径配置
+paths:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  output_dir: "outputs"
