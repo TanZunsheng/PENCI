@@ -342,9 +342,9 @@ def print_summary_recommendations(throughput_info, batch_size_per_gpu, n_gpus):
     print(f"       batch_size/GPU: {batch_size_per_gpu}")
     print(f"       全局 batch_size: {batch_size_per_gpu * n_gpus}")
     if batch_size_per_gpu <= 4:
-        print(f"\n  ⭐ 最重要: 这是 smoke_test 配置（batch_size=4），仅用于功能验证。")
-        print(f"     正式训练请使用 default.yaml（batch_size=32），")
-        print(f"     命令: bash scripts/run_train_8gpu.sh")
+        print(f"\n  ⭐ 最重要: 当前更像是轻量验证配置，建议切到 V1 正式训练入口。")
+        print(f"     正式训练请使用 configs/stage1_real.yaml（当前 batch_size=8 / num_workers=1），")
+        print(f"     命令: torchrun --nproc_per_node={n_gpus} scripts/v1/train_stage1.py --config configs/stage1_real.yaml")
 
 
 # ─── 主入口 ─────────────────────────────────────────────────────────────────

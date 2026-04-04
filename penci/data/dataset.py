@@ -37,6 +37,7 @@ from pathlib import Path
 
 try:
     import h5py
+
     HAS_H5PY = True
 except ImportError:
     HAS_H5PY = False
@@ -110,10 +111,7 @@ def _resolve_metadata_dir(data_root: str, dataset_name: str) -> str:
     tried = [standard]
     if nested is not None:
         tried.append(nested)
-    raise FileNotFoundError(
-        f"找不到数据集 '{dataset_name}' 的 metadata 目录。"
-        f"已尝试: {tried}"
-    )
+    raise FileNotFoundError(f"找不到数据集 '{dataset_name}' 的 metadata 目录。" f"已尝试: {tried}")
 
 
 class PENCIDataset(Dataset):
@@ -131,6 +129,7 @@ class PENCIDataset(Dataset):
         datasets: 仅加载指定数据集（列表）
         dtype: 输出数据类型
         precompute_fingerprints: 是否预计算所有样本的电极指纹
+        random_crop: 序列超长时是否随机裁窗；验证/评估建议关闭
     """
 
     def __init__(
@@ -144,6 +143,7 @@ class PENCIDataset(Dataset):
         datasets: List[str] = None,
         dtype: torch.dtype = torch.float32,
         precompute_fingerprints: bool = False,
+        random_crop: bool = True,
         rank: int = 0,
     ):
         super().__init__()
@@ -153,21 +153,19 @@ class PENCIDataset(Dataset):
         self.max_length = max_length
         self.target_channels = target_channels
         self.dtype = dtype
+        self.random_crop = bool(random_crop)
         self.rank = rank
 
         if metadata is not None:
             self.metadata = metadata
         elif metadata_path is not None:
-            with open(metadata_path, 'r') as f:
+            with open(metadata_path, "r") as f:
                 self.metadata = json.load(f)
         else:
             raise ValueError("必须提供 metadata_path 或 metadata 之一")
 
         if datasets is not None:
-            self.metadata = [
-                m for m in self.metadata
-                if m.get("dataset") in datasets
-            ]
+            self.metadata = [m for m in self.metadata if m.get("dataset") in datasets]
 
         if self.rank == 0:
             logger.info(f"加载了 {len(self.metadata)} 个样本")
@@ -254,9 +252,7 @@ class PENCIDataset(Dataset):
             fp = _compute_sample_fingerprint(meta["path"], self.data_root)
             self._fingerprint_cache[meta["path"]] = fp
             if self.rank == 0 and (i + 1) % 1000 == 0:
-                logger.info(
-                    f"  指纹计算进度: {i + 1}/{len(need_compute)}"
-                )
+                logger.info(f"  指纹计算进度: {i + 1}/{len(need_compute)}")
 
         unique_fps = set(self._fingerprint_cache.values())
         if self.rank == 0:
@@ -293,7 +289,9 @@ class PENCIDataset(Dataset):
             self._h5_handles[h5_abs_path] = h5py.File(h5_abs_path, "r")
         return self._h5_handles[h5_abs_path]
 
-    def _load_from_hdf5(self, meta: Dict) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def _load_from_hdf5(
+        self, meta: Dict
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         从 HDF5 文件加载单个样本
 
@@ -366,7 +364,9 @@ class PENCIDataset(Dataset):
         self._h5_pos_cache.clear()
         self._h5_sensor_type_cache.clear()
 
-    def _load_from_pt(self, meta: Dict) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def _load_from_pt(
+        self, meta: Dict
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """从 .pt 文件加载单个样本（回退路径）"""
         data_path = meta["path"]
         if self.data_root is not None:
@@ -403,30 +403,31 @@ class PENCIDataset(Dataset):
         if loaded is None:
             loaded = self._load_from_pt(meta)
         if loaded is None:
-            return self._get_dummy_sample(
-                meta.get("channels", self.target_channels or 128)
-            )
+            return self._get_dummy_sample(meta.get("channels", self.target_channels or 128))
 
         x, pos, sensor_type = loaded
         C, T = x.shape
         n_channels = C
 
         if T > self.max_length:
-            start = torch.randint(0, T - self.max_length + 1, (1,)).item()
-            x = x[:, start:start + self.max_length]
+            if self.random_crop:
+                start = torch.randint(0, T - self.max_length + 1, (1,)).item()
+            else:
+                start = 0
+            x = x[:, start : start + self.max_length]
         elif T < self.max_length:
-            x = F.pad(x, (0, self.max_length - T), mode='constant', value=0)
+            x = F.pad(x, (0, self.max_length - T), mode="constant", value=0)
 
         if self.target_channels is not None:
             if C < self.target_channels:
                 pad_c = self.target_channels - C
-                x = F.pad(x, (0, 0, 0, pad_c), mode='constant', value=0)
-                pos = F.pad(pos, (0, 0, 0, pad_c), mode='constant', value=0)
-                sensor_type = F.pad(sensor_type, (0, pad_c), mode='constant', value=0)
+                x = F.pad(x, (0, 0, 0, pad_c), mode="constant", value=0)
+                pos = F.pad(pos, (0, 0, 0, pad_c), mode="constant", value=0)
+                sensor_type = F.pad(sensor_type, (0, pad_c), mode="constant", value=0)
             elif C > self.target_channels:
-                x = x[:self.target_channels]
-                pos = pos[:self.target_channels]
-                sensor_type = sensor_type[:self.target_channels]
+                x = x[: self.target_channels]
+                pos = pos[: self.target_channels]
+                sensor_type = sensor_type[: self.target_channels]
 
         if self.transform is not None:
             x = self.transform(x)
@@ -448,7 +449,7 @@ class PENCIDataset(Dataset):
                 "hdf5_path": meta.get("hdf5_path", ""),
                 "hdf5_idx": int(meta.get("hdf5_idx", -1)) if "hdf5_idx" in meta else -1,
                 "sample_index": idx,
-            }
+            },
         }
 
     def _get_dummy_sample(self, n_channels: int = 128) -> Dict[str, torch.Tensor]:
@@ -460,13 +461,16 @@ class PENCIDataset(Dataset):
             "sensor_type": torch.zeros(c, dtype=torch.long),
             "n_channels": torch.tensor(c, dtype=torch.long),
             "metadata": {
-                "dataset": "dummy", "path": "",
-                "channels": c, "is_eeg": True, "is_meg": False,
+                "dataset": "dummy",
+                "path": "",
+                "channels": c,
+                "is_eeg": True,
+                "is_meg": False,
                 "fingerprint": "unknown",
                 "hdf5_path": "",
                 "hdf5_idx": -1,
                 "sample_index": -1,
-            }
+            },
         }
 
 
@@ -550,7 +554,7 @@ class BucketBatchSampler(Sampler):
 
             # 划分 batch
             for start in range(0, len(indices), self.batch_size):
-                batch = indices[start:start + self.batch_size]
+                batch = indices[start : start + self.batch_size]
                 if len(batch) < self.batch_size and self.drop_last:
                     continue
                 all_batches.append(batch)
@@ -651,16 +655,12 @@ class DistributedBucketBatchSampler(Sampler):
             total_batch_size = self.num_replicas * self.batch_size
             for key, indices in sorted(self.buckets.items(), key=lambda x: str(x[0])):
                 if self.drop_last:
-                    rem = (
-                        total_batch_size
-                        - (len(indices) % total_batch_size)
-                    ) % total_batch_size
+                    rem = (total_batch_size - (len(indices) % total_batch_size)) % total_batch_size
                     padded_len = len(indices) + rem
                     n_batches = padded_len // total_batch_size
                 else:
                     rem = (
-                        self.num_replicas
-                        - (len(indices) % self.num_replicas)
+                        self.num_replicas - (len(indices) % self.num_replicas)
                     ) % self.num_replicas
                     rank_len = (len(indices) + rem) // self.num_replicas
                     n_batches = rank_len // self.batch_size
@@ -669,7 +669,9 @@ class DistributedBucketBatchSampler(Sampler):
 
                 if use_fingerprint:
                     ch, fp = key
-                    logger.info(f"  桶 [{ch}ch, fp={fp}]: {len(indices)} 样本, 估计 {n_batches} batches")
+                    logger.info(
+                        f"  桶 [{ch}ch, fp={fp}]: {len(indices)} 样本, 估计 {n_batches} batches"
+                    )
                 else:
                     logger.info(f"  桶 [{key} ch]: {len(indices)} 样本, 估计 {n_batches} batches")
 
@@ -683,9 +685,7 @@ class DistributedBucketBatchSampler(Sampler):
                 f"整文件 block 连续消费，文件内{'打乱' if self.shuffle_within_file else '顺序'}采样）"
             )
 
-    def _cluster_shuffle(
-        self, indices: List[int], g: torch.Generator
-    ) -> List[int]:
+    def _cluster_shuffle(self, indices: List[int], g: torch.Generator) -> List[int]:
         """
         按 HDF5 文件聚簇打乱：受试者级随机 + 受试者内随机
 
@@ -741,9 +741,9 @@ class DistributedBucketBatchSampler(Sampler):
             if rem > 0:
                 ids_bucket.extend(ids_bucket[:rem])
 
-            ids_rank = ids_bucket[self.rank::self.num_replicas]
+            ids_rank = ids_bucket[self.rank :: self.num_replicas]
             for start in range(0, len(ids_rank), self.batch_size):
-                batch = ids_rank[start:start + self.batch_size]
+                batch = ids_rank[start : start + self.batch_size]
                 if len(batch) < self.batch_size:
                     continue
                 rank_batches.append(batch)
@@ -752,9 +752,9 @@ class DistributedBucketBatchSampler(Sampler):
             if rem > 0:
                 ids_bucket.extend(ids_bucket[:rem])
 
-            ids_rank = ids_bucket[self.rank::self.num_replicas]
+            ids_rank = ids_bucket[self.rank :: self.num_replicas]
             for start in range(0, len(ids_rank), self.batch_size):
-                batch = ids_rank[start:start + self.batch_size]
+                batch = ids_rank[start : start + self.batch_size]
                 if len(batch) < self.batch_size and self.drop_last:
                     continue
                 rank_batches.append(batch)
@@ -804,7 +804,10 @@ class DistributedBucketBatchSampler(Sampler):
 
         # 缺少文件信息时退回默认策略
         if not groups:
-            return [[batch] for batch in self._build_default_bucket_batches(ids_bucket, g, total_batch_size)]
+            return [
+                [batch]
+                for batch in self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
+            ]
 
         group_keys = sorted(groups.keys())
         if self.shuffle:
@@ -813,7 +816,10 @@ class DistributedBucketBatchSampler(Sampler):
 
         # 文件数过少时，文件级分配会让部分 rank 没有 batch，退回默认策略
         if len(group_keys) < self.num_replicas:
-            return [[batch] for batch in self._build_default_bucket_batches(ids_bucket, g, total_batch_size)]
+            return [
+                [batch]
+                for batch in self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
+            ]
 
         file_batches: List[Tuple[str, List[List[int]]]] = []
         for gk in group_keys:
@@ -828,7 +834,7 @@ class DistributedBucketBatchSampler(Sampler):
 
             batches: List[List[int]] = []
             for start in range(0, len(file_indices), self.batch_size):
-                batch = file_indices[start:start + self.batch_size]
+                batch = file_indices[start : start + self.batch_size]
                 if len(batch) < self.batch_size:
                     continue
                 batches.append(batch)
@@ -837,7 +843,10 @@ class DistributedBucketBatchSampler(Sampler):
                 file_batches.append((gk, batches))
 
         if not file_batches:
-            return [[batch] for batch in self._build_default_bucket_batches(ids_bucket, g, total_batch_size)]
+            return [
+                [batch]
+                for batch in self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
+            ]
 
         # 按文件可贡献的 batch 数做负载均衡，减少后续 min_batches 截断造成的样本浪费。
         # 先随机化原始顺序（训练时）再按 batch 数降序稳定排序，可保留同规模文件间的随机性。
@@ -856,11 +865,13 @@ class DistributedBucketBatchSampler(Sampler):
         min_batches = min(rank_batch_counts)
         if min_batches <= 0:
             # 某些小桶可能出现极端不均衡，退回默认策略保证训练不挂
-            return [[batch] for batch in self._build_default_bucket_batches(ids_bucket, g, total_batch_size)]
+            return [
+                [batch]
+                for batch in self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
+            ]
 
         truncated_rank_blocks = [
-            self._truncate_file_blocks(blocks, min_batches)
-            for blocks in rank_file_blocks
+            self._truncate_file_blocks(blocks, min_batches) for blocks in rank_file_blocks
         ]
         return truncated_rank_blocks[self.rank]
 
@@ -899,9 +910,7 @@ class DistributedBucketBatchSampler(Sampler):
                 )
                 all_file_blocks.extend(bucket_file_blocks)
             else:
-                bucket_batches = self._build_default_bucket_batches(
-                    ids_bucket, g, total_batch_size
-                )
+                bucket_batches = self._build_default_bucket_batches(ids_bucket, g, total_batch_size)
                 all_batches.extend(bucket_batches)
 
         if self.file_scheduler and self.cluster_by_file and self._idx_to_h5:
@@ -917,7 +926,7 @@ class DistributedBucketBatchSampler(Sampler):
                 chunk_size = max(1, self.batch_size // 2)
                 chunks = []
                 for i in range(0, len(all_batches), chunk_size):
-                    chunks.append(all_batches[i:i + chunk_size])
+                    chunks.append(all_batches[i : i + chunk_size])
                 cperm = torch.randperm(len(chunks), generator=g).tolist()
                 all_batches = []
                 for ci in cperm:
@@ -1241,9 +1250,9 @@ def get_train_val_loaders(
             logger.warning(f"数据集 '{ds_name}' 缺少 val.json: {val_path}，跳过")
             continue
 
-        with open(train_path, 'r') as f:
+        with open(train_path, "r") as f:
             train_meta = json.load(f)
-        with open(val_path, 'r') as f:
+        with open(val_path, "r") as f:
             val_meta = json.load(f)
 
         all_train_meta.extend(train_meta)
@@ -1254,9 +1263,7 @@ def get_train_val_loaders(
         )
 
     if not all_train_meta:
-        raise RuntimeError(
-            f"没有加载到任何训练样本。datasets={datasets}, data_root={data_root}"
-        )
+        raise RuntimeError(f"没有加载到任何训练样本。datasets={datasets}, data_root={data_root}")
 
     logger.info(
         f"合并完成: 训练 {len(all_train_meta)} 样本, "
@@ -1265,9 +1272,8 @@ def get_train_val_loaders(
 
     # 验证集支持独立的采样调度参数；这些键不应透传给训练集 dataset 构造。
     val_sampler_file_scheduler = dataset_kwargs.pop("val_sampler_file_scheduler", None)
-    val_sampler_shuffle_within_file = dataset_kwargs.pop(
-        "val_sampler_shuffle_within_file", None
-    )
+    val_sampler_shuffle_within_file = dataset_kwargs.pop("val_sampler_shuffle_within_file", None)
+    val_random_crop = dataset_kwargs.pop("val_random_crop", False)
 
     train_loader_kwargs = dict(dataset_kwargs)
     val_loader_kwargs = dict(dataset_kwargs)
@@ -1276,9 +1282,8 @@ def get_train_val_loaders(
     if val_sampler_shuffle_within_file is None:
         val_sampler_shuffle_within_file = False
     val_loader_kwargs["sampler_file_scheduler"] = bool(val_sampler_file_scheduler)
-    val_loader_kwargs["sampler_shuffle_within_file"] = bool(
-        val_sampler_shuffle_within_file
-    )
+    val_loader_kwargs["sampler_shuffle_within_file"] = bool(val_sampler_shuffle_within_file)
+    val_loader_kwargs["random_crop"] = bool(val_random_crop)
 
     train_loader = create_dataloader(
         metadata=all_train_meta,

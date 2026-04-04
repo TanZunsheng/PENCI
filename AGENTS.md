@@ -1,10 +1,13 @@
-# AGENTS.md — PENCI Codebase Guide
+# AGENTS.md — PENCI V1 Codebase Guide
 
 ## Project Overview
 
-PENCI (Physics-constrained End-to-end Neural Connectivity Inference) is a PyTorch-based deep learning
-framework for inferring neural dynamics from EEG/MEG signals. It uses a "sandwich" architecture:
-Encoder (from BrainOmni) → Dynamics Core (Transformer/RNN) → Physics Decoder (leadfield matrix).
+PENCI 当前的活动主线是 V1 两阶段建模框架：
+1. `Stage1Model` 从 EEG/MEG 恢复显式脑区状态 `S_t`
+2. `StaticConnectivityModel` 在冻结 `S_t` 上学习静态有效连接 `A_base`
+3. 共享基础设施提供 DDP、HDF5、file scheduler、node-union page-cache prefetch 与动态导联场支持
+
+旧版单阶段主线已迁移到 `deprecated_legacy_archive/`。除非用户明确要求查看归档内容，否则默认只面向当前 V1 主线工作。
 
 **Language**: Python 3.9+  |  **Framework**: PyTorch 2.0+  |  **Conda env**: `/work/2024/tanzunsheng/anaconda3/envs/EEG`
 
@@ -13,130 +16,176 @@ Encoder (from BrainOmni) → Dynamics Core (Transformer/RNN) → Physics Decoder
 ## Build / Install / Run
 
 ```bash
-pip install -e .                 # Editable install
-pip install -e ".[dev]"          # With dev deps (pytest, black, isort, flake8, mypy)
-pip install -r requirements.txt  # Dependencies only
+pip install -e .
+pip install -e ".[dev]"
+pip install -r requirements.txt
 ```
 
 ## Test / Lint / Format
 
 ```bash
-pytest                                     # All tests (11 in test_smoke.py)
-pytest tests/test_smoke.py::test_modules   # Single test function
-pytest --cov=penci                         # With coverage
-python tests/test_smoke.py                 # Standalone smoke test (no pytest)
+pytest
+pytest tests/test_smoke.py::test_v1_stage1_model
+pytest --cov=penci
+python tests/test_smoke.py
 
-black penci/ tests/ scripts/    # Format (line-length=100)
-isort penci/ tests/ scripts/    # Sort imports (profile=black)
-flake8 penci/ tests/ scripts/   # Lint
-mypy penci/                     # Type check (ignore_missing_imports=true)
+black penci/ tests/ scripts/
+isort penci/ tests/ scripts/
+flake8 penci/ tests/ scripts/
+mypy penci/
 ```
 
-All tool configs live in `pyproject.toml`. Pytest: `testpaths = ["tests"]`, `addopts = "-v --tb=short"`.
+All tool configs live in `pyproject.toml`. Pytest uses `testpaths = ["tests"]` and `addopts = "-v --tb=short"`.
 
 ## Training
 
+### Stage1 simulation pretrain
+
 ```bash
-# Single GPU
-python scripts/train.py --config configs/default.yaml
-
-# Multi-GPU DDP (e.g. 5 GPUs)
-torchrun --nproc_per_node=5 scripts/train.py --config configs/default.yaml --output_dir outputs/exp1
-
-# Evaluation
-python scripts/evaluate.py --config configs/default.yaml --checkpoint outputs/exp1/best_model.pt
+python scripts/v1/train_stage1.py --config configs/stage1_sim.yaml --mode sim_pretrain
 ```
 
-**DDP notes**: `batch_size` in config is **per-GPU**. Learning rate scales linearly:
-`effective_lr = base_lr × world_size`. NCCL timeout is set to 60 minutes.
+### Stage1 real-data finetune
+
+```bash
+python scripts/v1/train_stage1.py --config configs/stage1_real.yaml --mode real_finetune
+```
+
+### Stage1 multi-GPU DDP
+
+```bash
+torchrun --nproc_per_node=5 scripts/v1/train_stage1.py --config configs/stage1_real.yaml --mode real_finetune
+```
+
+### Stage1 evaluation
+
+```bash
+python scripts/v1/evaluate_stage1.py --config configs/stage1_eval.yaml --checkpoint outputs/stage1_real/best_model.pt --dataset_mode real
+```
+
+### Stage2 train / eval
+
+```bash
+python scripts/v1/train_stage2.py --config configs/stage2_connectivity.yaml --stage1_checkpoint outputs/stage1_real/best_model.pt
+python scripts/v1/evaluate_stage2.py --config configs/stage2_eval.yaml --stage1_checkpoint outputs/stage1_real/best_model.pt --stage2_checkpoint outputs/stage2/best_model.pt
+```
+
+**DDP notes**:
+- `training.batch_size` is per-GPU in DDP mode
+- `scripts/v1/train_stage1.py` reads `training.learning_rate` literally; if you want linear LR scaling, do it explicitly in config
+- NCCL timeout / barrier handling / unwrap helpers live in `penci/training/distributed.py`
 
 ---
 
 ## Project Structure
 
-```
+```text
 penci/
-├── __init__.py              # Top-level: PENCI, PENCILite, build_penci_from_config
-├── modules/                 # Base building blocks (ported from BrainOmni — modify carefully)
-│   ├── attention.py         # RMSNorm, FeedForward, SelfAttention, RotaryEmbedding
-│   ├── conv.py              # SConv1d, SConvTranspose1d
-│   ├── lstm.py              # SLSTM
-│   └── seanet.py            # SEANetEncoder, SEANetResnetBlock, Snake1d
-├── encoders/                # Encoder modules (ported from BrainOmni — modify carefully)
-│   ├── sensor_embed.py      # BrainSensorModule
-│   ├── backward_solution.py # BackWardSolution, ForwardSolution
-│   └── encoder.py           # PENCIEncoder, BrainTokenizerEncoder
-├── models/                  # Model definitions (original PENCI code)
-│   ├── dynamics.py          # DynamicsCore (Transformer), DynamicsRNN
-│   ├── physics_decoder.py   # PhysicsDecoder, SEANetPhysicsDecoder
-│   └── penci_model.py       # PENCI, PENCILite, build_penci_from_config
-├── physics/                 # Physics constraint utilities (lazy imports for heavy deps)
-│   ├── source_space.py      # SourceSpace (72 brain regions)
-│   ├── electrode_utils.py   # ElectrodeConfigRegistry, compute_fingerprint_from_pos
-│   └── leadfield_manager.py # LeadfieldManager — MNE-based computation + caching
-├── utils/
-│   └── metrics.py           # pearson_correlation, snr_db, nrmse (evaluation metrics)
-└── data/
-    └── dataset.py           # PENCIDataset, PENCICollator, BucketBatchSampler,
-                             # DistributedBucketBatchSampler, RandomScaling, RandomNoise
+├── __init__.py              # Top-level V1 + shared re-exports
+├── modules/                 # BrainOmni-ported low-level blocks — modify carefully
+│   ├── attention.py
+│   ├── conv.py
+│   ├── lstm.py
+│   └── seanet.py
+├── encoders/                # BrainOmni-ported encoders — modify carefully
+│   ├── sensor_embed.py
+│   ├── backward_solution.py
+│   └── encoder.py
+├── v1/                      # Active two-stage mainline
+│   ├── models/
+│   │   ├── stage1_model.py      # Stage1Model, build_stage1_model_from_config
+│   │   ├── connectivity.py      # StaticConnectivityModel, build_stage2_model_from_config
+│   │   └── state_head.py        # StateHead
+│   └── data/
+│       └── simulation_dataset.py
+├── shared/                  # Shared model components used by V1
+│   └── models/
+│       ├── dynamics.py          # DynamicsCore, DynamicsRNN
+│       └── physics_decoder.py   # PhysicsDecoder, SEANetPhysicsDecoder
+├── training/                # Shared training infrastructure
+│   ├── distributed.py          # setup_distributed, unwrap_model, sync helpers
+│   ├── prefetch.py             # page-cache prefetch and planning
+│   └── physics.py              # setup_physics, resolve_leadfield_for_batch
+├── data/
+│   └── dataset.py           # PENCIDataset, collator, HDF5 / file scheduler loaders
+├── physics/
+│   ├── source_space.py
+│   ├── electrode_utils.py
+│   └── leadfield_manager.py
+└── utils/
+    ├── metrics.py
+    └── state_metrics.py
 
 scripts/
-├── train.py                     # Single/multi-GPU training (DDP-aware)
-├── evaluate.py                  # Model evaluation with full metrics
-├── precompute_all_leadfields.py # Batch leadfield precomputation
-├── convert_to_hdf5.py          # Data format conversion
-└── convert_hbn_to_hdf5.py      # HBN dataset conversion
+├── v1/
+│   ├── train_stage1.py
+│   ├── evaluate_stage1.py
+│   ├── train_stage2.py
+│   ├── evaluate_stage2.py
+│   ├── generate_stage1_sim_data.py
+│   └── generate_stage2_sim_data.py
+├── convert_to_hdf5.py
+├── convert_hbn_to_hdf5.py
+├── convert_to_hdf5_by_fingerprint.py
+└── precompute_all_leadfields.py
 
 configs/
-├── default.yaml       # Full training config
-└── smoke_test.yaml    # Quick validation config
+├── stage1_sim.yaml
+├── stage1_real.yaml
+├── stage1_eval.yaml
+├── stage2_connectivity.yaml
+└── stage2_eval.yaml
 
-tests/
-├── test_smoke.py          # 11 tests (modules, encoders, models, data, config)
-├── diagnose_system.py     # System diagnostic tool
-└── analyze_training_log.py
-
-docs/                      # Chinese documentation (8 files)
+deprecated_legacy_archive/
+├── moved/                   # Archived legacy code and docs
+└── snapshots/               # Snapshots before rewrites
 ```
 
-**Key rule**: `penci/modules/` and `penci/encoders/` are ported from BrainOmni — modify carefully
-and preserve original behavior. `penci/models/` and `penci/physics/` are original PENCI code.
+**Key rule**: `penci/modules/` and `penci/encoders/` are ported from BrainOmni. Modify carefully and preserve established behavior unless the user explicitly asks for a behavior change.
 
 ---
 
 ## Key Patterns
 
-### Electrode Fingerprint System
+### Stage1 real-data I/O path
 
-Electrode configurations vary across datasets. `ElectrodeConfigRegistry` in `electrode_utils.py`
-identifies configurations by a position-based fingerprint (`compute_fingerprint_from_pos`), enabling
-automatic leadfield matrix lookup and caching per unique electrode layout.
+The active high-throughput path is `scripts/v1/train_stage1.py --mode real_finetune`.
+It reuses the shared real-data loader stack in `penci/data/dataset.py`:
+- HDF5-first sample loading with `.pt` fallback
+- `BucketBatchSampler` / `DistributedBucketBatchSampler`
+- `file_scheduler` to cluster batches by HDF5 file
+- per-worker HDF5 handle caching
 
-### DDP `unwrap_model()` Pattern
+### Node-union page-cache prefetch
 
-DDP wraps models but does **not** proxy custom methods (`compute_loss`, `_prepare_target`).
-Both `train.py` and `evaluate.py` define a local `unwrap_model()` helper:
+The prefetch planner/executor lives in `penci/training/prefetch.py`.
+For DDP real-data finetune, rank schedules can be gathered and merged into a node-level warmup plan.
+Relevant config lives under `data.io_prefetch` in `configs/stage1_real.yaml`.
+
+### Dynamic leadfield resolution
+
+Dynamic leadfield setup lives in `penci/training/physics.py` and `penci/physics/`.
+In real-data Stage1 training:
+- rank 0 prepares / warms leadfield resources when needed
+- `resolve_leadfield_for_batch()` chooses per-batch leadfield tensors
+- the resolved leadfield is passed into `Stage1Model.forward(..., leadfield=...)`
+
+### DDP `unwrap_model()` pattern
+
+DDP does not proxy custom methods reliably. Use the shared helper in `penci/training/distributed.py`:
 
 ```python
 def unwrap_model(model):
-    return model.module if hasattr(model, 'module') else model
+    return model.module if hasattr(model, "module") else model
 
-# Rule: forward() goes through DDP wrapper; custom methods go through unwrap_model()
-loss_dict = unwrap_model(model).compute_loss(x, pos, sensor_type, ...)
+loss_dict = unwrap_model(model).compute_stage1_loss_real(...)
 ```
 
-### DDP Setup Gotchas
+### Simulation vs. real-data split
 
-- Call `torch.cuda.set_device(local_rank)` **before** `init_process_group` — never pass `device_id`
-- Leadfield warmup: rank-0 only, then `dist.barrier()` (avoids file lock contention)
-- Use `sync_ranks(world_size, local_rank)` with explicit `device_ids=[local_rank]`
-- See `docs/ddp_hang_diagnosis.md` and `docs/ddp_attribute_error_fix.md` for past issues
-
-### Multi-Dataset Data Loading
-
-`PENCIDataset` supports multiple dataset directories. `PENCICollator` pads variable-length channels.
-`DistributedBucketBatchSampler` groups similar-length samples for efficient DDP training with
-minimal padding waste. Data augmentation: `RandomScaling`, `RandomNoise`, composable via `Compose`.
+- Simulation datasets live under `penci/v1/data/simulation_dataset.py`
+- Real EEG/MEG loading lives under `penci/data/dataset.py`
+- Do not mix the simulation loader path with the real-data HDF5 / scheduler path unless you are intentionally extending Stage2 to real data
 
 ---
 
@@ -145,35 +194,46 @@ minimal padding waste. Data augmentation: `RandomScaling`, `RandomNoise`, compos
 ### Imports & Headers
 
 Every `.py` file starts with `# -*- coding: utf-8 -*-` and a module docstring.
-Strict 3-group import ordering: stdlib → third-party → local (absolute imports only, never relative).
+Use 3-group import ordering: stdlib → third-party → local. Prefer absolute imports over relative imports.
 
 ### Naming
 
 | Category | Style | Examples |
 |---|---|---|
-| Classes | `PascalCase` | `PENCI`, `DynamicsCore`, `PhysicsDecoder` |
-| Functions/methods | `snake_case` | `compute_loss`, `build_penci_from_config` |
-| Private methods | `_leading_underscore` | `_prepare_target` |
-| Tensor dims (einops) | Single uppercase | `B N T D`, `(B N) T D` |
+| Classes | `PascalCase` | `Stage1Model`, `StaticConnectivityModel`, `PhysicsDecoder` |
+| Functions/methods | `snake_case` | `build_stage1_model_from_config`, `resolve_leadfield_for_batch` |
+| Private methods | `_leading_underscore` | `_build_sim_loader` |
+| Tensor dims (einops) | Single uppercase | `B C T`, `B N T D` |
 
 ### Docstrings & Types
 
-Chinese-primary docstrings. Always document tensor shapes (`(B, C, T)`). Type annotations required
-on all public method signatures. Use `einops.rearrange` for reshaping, not `.view()/.reshape()`.
+Chinese-primary docstrings are preferred. Public methods should include type annotations.
+Document tensor shapes when they are not obvious.
+Use `einops.rearrange` when reshaping semantics matter.
 
 ### Module Patterns
 
-- Each subpackage re-exports public API with explicit `__all__`
-- `penci/physics/__init__.py` uses lazy `__getattr__` for heavy optional imports (MNE)
-- `RuntimeError` for missing required args; `assert` only in tests
-- Use `logging` module: `logger = logging.getLogger(__name__)`
+- Public subpackages should re-export their API with explicit `__all__`
+- `penci/physics/__init__.py` may use lazy imports for heavy optional dependencies
+- Use `RuntimeError` for missing required runtime arguments
+- Prefer `logging.getLogger(__name__)` over `print()` in library code
 
 ### Configuration
 
-YAML configs in `configs/` loaded via `yaml.safe_load()`. Nested access with defaults:
-`config.get("training", {}).get("lr", 1e-4)`. Model construction: `build_penci_from_config(config)`.
+Load YAML with `yaml.safe_load()`.
+Access nested config with `.get()` defaults, e.g. `config.get("training", {}).get("batch_size", 8)`.
+Current model builders are:
+- `build_stage1_model_from_config(config)`
+- `build_stage2_model_from_config(config)`
 
 ### Testing
 
-Tests are standalone-runnable and pytest-compatible. Name functions `test_<component>`.
-Some tests skip gracefully when external data/MNE is unavailable.
+Tests are standalone-runnable and pytest-compatible. Use `test_<component>` naming.
+`tests/test_smoke.py` is the main regression suite and currently covers 20 smoke tests focused on the active V1 mainline.
+
+---
+
+## Archive Policy
+
+If you need historical context, check `deprecated_legacy_archive/`.
+Do not restore archived legacy files into the active tree unless the user explicitly asks for rollback or comparison work.

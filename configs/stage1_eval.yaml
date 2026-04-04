@@ -1,0 +1,52 @@
+# PENCI V1 Stage1 独立评估配置
+
+model:
+  n_dim: 256
+  n_neuro: 72
+  n_head: 4
+  dropout: 0.0
+  window_size: 512
+  seanet:
+    n_filters: 32
+    ratios: [8, 4, 2]
+    kernel_size: 7
+    last_kernel_size: 7
+  physics:
+    use_fixed_leadfield: true
+    leadfield_path: null
+    sensor_average_reference: true
+  stage1:
+    hidden_dim: 128
+    state_activation: "identity"
+
+data:
+  n_channels: 128
+  window_length: 256
+  time_window: 10
+  use_bucket_sampler: true
+  use_fingerprint: true
+  stage1_sim_eval_metadata: "/work/2024/tanzunsheng/PENCI_sim_data/stage1_all_templates/hdf5/stage1_val_metadata_hdf5_all.json"
+  file_scheduler:
+    enabled: true
+    shuffle_within_file: true
+    val_enabled: true
+    val_shuffle_within_file: false
+  real_eval_metadata: "/work/2024/tanzunsheng/PENCIData/HBN_EEG-metadata/val.json"
+
+evaluation:
+  batch_size: 4
+  num_workers: 0
+  use_amp: true
+  progress_log_pct: 10
+
+hardware:
+  device: "cuda"
+
+physics:
+  subjects_dir: "/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data"
+  leadfield_cache_dir: "/work/2024/tanzunsheng/leadfield_cache"
+  processed_data_dir: "/work/2024/tanzunsheng/ProcessedData"
+  fingerprint_registry_path: "/work/2024/tanzunsheng/leadfield_cache/fingerprint_registry.pt"
+
+paths:
+  stage1_eval_output: "outputs/stage1_eval.json"

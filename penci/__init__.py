@@ -3,18 +3,36 @@
 PENCI: Physics-constrained End-to-end Neural Connectivity Inference
 物理约束端到端神经连接推断框架
 
-该框架实现了一个"三明治"结构的端到端深度学习模型：
-1. 通用编码器 (Universal Encoder) - 改编自 BrainOmni
-2. 动力学核心 (Dynamics Core) - 学习源空间的时序演化
-3. 物理解码器 (Physics Decoder) - 使用导联场矩阵投影回传感器空间
+当前主线为 V1 两阶段建模：
+1. Stage1: 从 EEG 恢复显式脑区状态 S_t，并通过物理投影闭环
+2. Stage2: 在冻结的 S_t 上学习静态有效连接 A_base
+3. 共享层: 编码器、动力学模块、物理解码器与训练基础设施
 """
 
 __version__ = "0.2.0"
 __author__ = "PENCI Team"
 
-from penci.models.penci_model import PENCI, PENCILite, build_penci_from_config
+from penci.shared.models import DynamicsCore, DynamicsRNN, PhysicsDecoder, SEANetPhysicsDecoder
+from penci.v1 import (
+    Stage1Model,
+    Stage1SimulationDataset,
+    Stage2ConnectivitySimulationDataset,
+    StateHead,
+    StaticConnectivityModel,
+    build_stage1_model_from_config,
+    build_stage2_model_from_config,
+)
 
-# 别名，保持向后兼容
-PENCIModel = PENCI
-
-__all__ = ["PENCI", "PENCILite", "PENCIModel", "build_penci_from_config"]
+__all__ = [
+    "DynamicsCore",
+    "DynamicsRNN",
+    "PhysicsDecoder",
+    "SEANetPhysicsDecoder",
+    "Stage1Model",
+    "StateHead",
+    "StaticConnectivityModel",
+    "Stage1SimulationDataset",
+    "Stage2ConnectivitySimulationDataset",
+    "build_stage1_model_from_config",
+    "build_stage2_model_from_config",
+]

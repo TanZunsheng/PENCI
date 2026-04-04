@@ -10,7 +10,7 @@ PENCI 训练监控和评估指标
 所有函数接受 (B, C, T) 张量，返回标量。
 """
 
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -51,7 +51,32 @@ def _safe_masked_mean(values: torch.Tensor, valid_mask: torch.Tensor) -> Dict[st
     }
 
 
-def pearson_correlation(x: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
+def _build_channel_mask(
+    x: torch.Tensor,
+    n_channels: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """
+    根据每个样本的有效通道数构造 (B, C) mask。
+    """
+    if n_channels is None:
+        return None
+    if x.dim() != 3:
+        raise ValueError(f"x 需为 (B,C,T)，收到: {tuple(x.shape)}")
+    if not torch.is_tensor(n_channels):
+        n_channels = torch.as_tensor(n_channels, device=x.device)
+    if n_channels.dim() == 0:
+        n_channels = n_channels.unsqueeze(0)
+    if n_channels.numel() == 1 and x.shape[0] > 1:
+        n_channels = n_channels.expand(x.shape[0])
+    channel_index = torch.arange(x.shape[1], device=x.device).unsqueeze(0)
+    return channel_index < n_channels.to(device=x.device).view(-1, 1)
+
+
+def pearson_correlation(
+    x: torch.Tensor,
+    x_hat: torch.Tensor,
+    n_channels: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
     逐通道 Pearson 相关系数，返回全 batch 均值
 
@@ -70,30 +95,36 @@ def pearson_correlation(x: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
 
     # 逐通道计算相关系数: (B, C)
     numerator = (x_centered * x_hat_centered).sum(dim=-1)
-    denominator = (
-        torch.sqrt((x_centered ** 2).sum(dim=-1))
-        * torch.sqrt((x_hat_centered ** 2).sum(dim=-1))
+    denominator = torch.sqrt((x_centered**2).sum(dim=-1)) * torch.sqrt(
+        (x_hat_centered**2).sum(dim=-1)
     )
 
     # 避免除零
     corr = numerator / (denominator + 1e-8)
-
-    return corr.mean()
+    valid_mask = denominator > 1e-8
+    channel_mask = _build_channel_mask(x, n_channels=n_channels)
+    if channel_mask is not None:
+        valid_mask = valid_mask & channel_mask
+    return _safe_masked_mean(corr, valid_mask)["mean"]
 
 
 def signal_to_noise_ratio_stats(
     x: torch.Tensor,
     x_hat: torch.Tensor,
     signal_norm_eps: float = DEFAULT_SIGNAL_NORM_EPS,
+    n_channels: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     信噪比 (dB) 统计量。
 
     对真值能量过低的通道，SNR 在数学上不稳定/无定义，因此直接跳过。
     """
-    signal_power = (x ** 2).sum(dim=-1)
+    signal_power = (x**2).sum(dim=-1)
     noise_power = ((x - x_hat) ** 2).sum(dim=-1)
     valid_mask = torch.sqrt(signal_power) > signal_norm_eps
+    channel_mask = _build_channel_mask(x, n_channels=n_channels)
+    if channel_mask is not None:
+        valid_mask = valid_mask & channel_mask
     snr = 10.0 * torch.log10(signal_power / (noise_power + 1e-8))
     return _safe_masked_mean(snr, valid_mask)
 
@@ -102,6 +133,7 @@ def signal_to_noise_ratio(
     x: torch.Tensor,
     x_hat: torch.Tensor,
     signal_norm_eps: float = DEFAULT_SIGNAL_NORM_EPS,
+    n_channels: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     信噪比 (dB)
@@ -116,7 +148,7 @@ def signal_to_noise_ratio(
         标量张量，所有通道和样本的平均 SNR (dB)
     """
     return signal_to_noise_ratio_stats(
-        x, x_hat, signal_norm_eps=signal_norm_eps
+        x, x_hat, signal_norm_eps=signal_norm_eps, n_channels=n_channels
     )["mean"]
 
 
@@ -124,6 +156,7 @@ def normalized_rmse_stats(
     x: torch.Tensor,
     x_hat: torch.Tensor,
     signal_norm_eps: float = DEFAULT_SIGNAL_NORM_EPS,
+    n_channels: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     NRMSE 统计量。
@@ -131,8 +164,11 @@ def normalized_rmse_stats(
     对真值范数过低的通道，NRMSE 的分母接近 0，会人为放大误差，因此直接跳过。
     """
     error_norm = torch.sqrt(((x - x_hat) ** 2).sum(dim=-1))
-    signal_norm = torch.sqrt((x ** 2).sum(dim=-1))
+    signal_norm = torch.sqrt((x**2).sum(dim=-1))
     valid_mask = signal_norm > signal_norm_eps
+    channel_mask = _build_channel_mask(x, n_channels=n_channels)
+    if channel_mask is not None:
+        valid_mask = valid_mask & channel_mask
     nrmse = error_norm / (signal_norm + 1e-8)
     return _safe_masked_mean(nrmse, valid_mask)
 
@@ -141,6 +177,7 @@ def normalized_rmse(
     x: torch.Tensor,
     x_hat: torch.Tensor,
     signal_norm_eps: float = DEFAULT_SIGNAL_NORM_EPS,
+    n_channels: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     归一化均方根误差
@@ -154,15 +191,16 @@ def normalized_rmse(
     返回:
         标量张量，所有通道和样本的平均 NRMSE (越低越好)
     """
-    return normalized_rmse_stats(
-        x, x_hat, signal_norm_eps=signal_norm_eps
-    )["mean"]
+    return normalized_rmse_stats(x, x_hat, signal_norm_eps=signal_norm_eps, n_channels=n_channels)[
+        "mean"
+    ]
 
 
 def compute_all_metrics(
     x: torch.Tensor,
     x_hat: torch.Tensor,
     signal_norm_eps: float = DEFAULT_SIGNAL_NORM_EPS,
+    n_channels: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     一次计算所有传感器空间指标
@@ -186,13 +224,13 @@ def compute_all_metrics(
         }
     """
     snr_stats = signal_to_noise_ratio_stats(
-        x, x_hat, signal_norm_eps=signal_norm_eps
+        x, x_hat, signal_norm_eps=signal_norm_eps, n_channels=n_channels
     )
     nrmse_stats = normalized_rmse_stats(
-        x, x_hat, signal_norm_eps=signal_norm_eps
+        x, x_hat, signal_norm_eps=signal_norm_eps, n_channels=n_channels
     )
     return {
-        "pearson": pearson_correlation(x, x_hat),
+        "pearson": pearson_correlation(x, x_hat, n_channels=n_channels),
         "snr_db": snr_stats["mean"],
         "snr_db_sum": snr_stats["sum"],
         "snr_db_count": snr_stats["count"],

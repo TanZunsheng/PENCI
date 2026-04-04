@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-PENCI 模型模块
+PENCI V1 两阶段主线。
 """
 
-from penci.shared.models import DynamicsCore, DynamicsRNN, PhysicsDecoder, SEANetPhysicsDecoder
+from penci.v1.data import Stage1SimulationDataset, Stage2ConnectivitySimulationDataset
 from penci.v1.models import (
     Stage1Model,
     StateHead,
@@ -13,13 +13,11 @@ from penci.v1.models import (
 )
 
 __all__ = [
-    "DynamicsCore",
-    "DynamicsRNN",
-    "PhysicsDecoder",
-    "SEANetPhysicsDecoder",
-    "StateHead",
     "Stage1Model",
+    "StateHead",
     "StaticConnectivityModel",
+    "Stage1SimulationDataset",
+    "Stage2ConnectivitySimulationDataset",
     "build_stage1_model_from_config",
     "build_stage2_model_from_config",
 ]

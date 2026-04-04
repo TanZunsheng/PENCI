@@ -1,0 +1,37 @@
+# PENCI V1 Stage2 独立评估配置
+
+model:
+  n_dim: 256
+  n_neuro: 72
+  n_head: 4
+  dropout: 0.0
+  window_size: 512
+  seanet:
+    n_filters: 32
+    ratios: [8, 4, 2]
+    kernel_size: 7
+    last_kernel_size: 7
+  physics:
+    use_fixed_leadfield: true
+    leadfield_path: null
+  stage1:
+    hidden_dim: 128
+    state_activation: "identity"
+  stage2:
+    lag_order: 2
+
+data:
+  n_channels: 128
+  stage2_sim_eval_metadata: "/work/2024/tanzunsheng/PENCI_sim_data/stage2/stage2_val_metadata.json"
+
+evaluation:
+  batch_size: 16
+  num_workers: 0
+  use_ground_truth_state: false
+  connectivity_threshold: 1.0e-4
+
+hardware:
+  device: "cuda"
+
+paths:
+  stage2_eval_output: "outputs/stage2_eval.json"

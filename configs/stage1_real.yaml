@@ -1,0 +1,75 @@
+# PENCI V1 Stage1 真实数据微调配置
+
+model:
+  n_dim: 256
+  n_neuro: 72
+  n_head: 4
+  dropout: 0.0
+  window_size: 512
+  seanet:
+    n_filters: 32
+    ratios: [8, 4, 2]
+    kernel_size: 7
+    last_kernel_size: 7
+  physics:
+    use_fixed_leadfield: true
+    leadfield_path: null
+    sensor_average_reference: true
+  stage1:
+    hidden_dim: 128
+    state_activation: "identity"
+
+data:
+  data_root: "/work/2024/tanzunsheng/PENCIData"
+  n_channels: 128
+  window_length: 256
+  time_window: 10
+  real_train_metadata: "/work/2024/tanzunsheng/PENCIData/HBN_EEG-metadata/train.json"
+  real_val_metadata: "/work/2024/tanzunsheng/PENCIData/HBN_EEG-metadata/val.json"
+  use_bucket_sampler: true
+  use_fingerprint: true
+  file_scheduler:
+    enabled: true
+    shuffle_within_file: true
+    val_enabled: true
+    val_shuffle_within_file: false
+  io_prefetch:
+    enabled: true
+    warmup_gb: 80
+    low_watermark_gb: 60
+    warmup_each_epoch: true
+    async_refill: true
+    scope: "node_union"
+    startup_policy: "high_watermark"
+    prefetch_threads: 1
+    read_chunk_mb: 8
+    max_files: 0
+    warmup_before_val: true
+    warmup_val_gb: 40
+    max_files_val: 0
+
+physics:
+  subjects_dir: "/work/2024/tanzunsheng/mne_data/MNE-fsaverage-data"
+  leadfield_cache_dir: "/work/2024/tanzunsheng/leadfield_cache"
+  processed_data_dir: "/work/2024/tanzunsheng/ProcessedData"
+  fingerprint_registry_path: "/work/2024/tanzunsheng/leadfield_cache/fingerprint_registry.pt"
+
+training:
+  epochs: 10
+  batch_size: 8
+  num_workers: 1
+  learning_rate: 5.0e-5
+  weight_decay: 0.0
+  gradient_clip: 0.5
+  use_amp: true
+  loss:
+    reconstruction: 1.0
+    state_supervision: 0.0
+    state_smoothness: 1.0e-2
+    state_energy: 1.0e-3
+
+hardware:
+  device: "cuda"
+
+paths:
+  output_dir: "outputs/stage1_real"

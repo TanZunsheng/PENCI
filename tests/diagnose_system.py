@@ -334,12 +334,12 @@ def print_final_summary():
     print("""
   [优先级 1] ⭐ 使用正式配置启动训练（最重要）
      当前问题: smoke_test 的 batch_size=4 远低于 4090D 的最佳工作点
-     解决: bash scripts/run_train_8gpu.sh  （使用 batch_size=32）
-     预期效果: GPU 利用率从 ~10% → 60-80%, 吞吐量提升 8x
+     解决: torchrun --nproc_per_node=8 scripts/v1/train_stage1.py --config configs/stage1_real.yaml
+     预期效果: 使用 V1 主线真实数据训练入口，避免误用已归档的旧主线脚本
 
-  [优先级 2] ⭐ 将 num_workers 从 4 降到 2（已确认 NFS 有压力）
-     当前: 8 GPU × 4 workers = 32 个 worker 进程并发打开 NFS 文件
-     修改: configs/default.yaml 中 num_workers: 2
+  [优先级 2] ⭐ 控制 num_workers，继续优先稳住 NFS I/O 压力
+     当前: stage1_real.yaml 已将 num_workers 设为 1，避免多进程并发抢占 NFS
+     修改: 如需调参，请在 configs/stage1_real.yaml 中将 num_workers 控制在 1-2
      预期效果: context switch 从 ~35000/s 降到 ~20000/s, SSH 卡顿减轻
 
   [优先级 3] 💡 检查是否有本地 SSD（见上方磁盘检查）

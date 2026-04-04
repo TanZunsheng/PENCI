@@ -1,0 +1,51 @@
+# PENCI V1 Stage2 静态连接训练配置
+
+model:
+  n_dim: 256
+  n_neuro: 72
+  n_head: 4
+  dropout: 0.0
+  window_size: 512
+  seanet:
+    n_filters: 32
+    ratios: [8, 4, 2]
+    kernel_size: 7
+    last_kernel_size: 7
+  physics:
+    use_fixed_leadfield: true
+    leadfield_path: null
+  stage1:
+    hidden_dim: 128
+    state_activation: "identity"
+  stage2:
+    lag_order: 2
+
+data:
+  n_channels: 128
+  stage2_sim_train_metadata: "/work/2024/tanzunsheng/PENCI_sim_data/stage2/stage2_train_metadata.json"
+  stage2_sim_val_metadata: "/work/2024/tanzunsheng/PENCI_sim_data/stage2/stage2_val_metadata.json"
+
+training:
+  epochs: 30
+  batch_size: 16
+  num_workers: 0
+  learning_rate: 5.0e-4
+  weight_decay: 0.0
+  max_radius: 0.98
+  use_ground_truth_state: false
+  loss:
+    state_prediction: 1.0
+    next_sensor: 1.0
+    l1_sparsity: 1.0e-3
+    stability: 1.0e-2
+
+evaluation:
+  use_ground_truth_state: false
+  connectivity_threshold: 1.0e-4
+
+hardware:
+  device: "cuda"
+
+paths:
+  output_dir: "outputs/stage2"
+  stage2_eval_output: "outputs/stage2/eval.json"

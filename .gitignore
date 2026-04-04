@@ -106,6 +106,17 @@ checkpoints/
 outputs/
 results/
 
+# Local-only planning / references / scratch
+tmp/
+plan/
+plan.md
+train_launch.log
+BrainOmni.pdf
+虚拟脑.pdf
+PENCI_V1最小可执行计划.md
+PENCI两层连接建模计划.md
+configs/stage1_real_mixed_bs20_8xa6000.yaml
+
 # OS
 .DS_Store
 Thumbs.db

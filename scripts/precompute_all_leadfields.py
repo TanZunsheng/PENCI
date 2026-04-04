@@ -4,7 +4,7 @@
 离线预计算全局电极指纹注册表 + 导联场矩阵
 
 两阶段架构的「离线阶段」：
-1. 扫描 PENCIData 下所有 metadata JSON，按 (dataset, channels) 分组
+1. 扫描 PENCIData 下所有 metadata JSON，按目录组流式计算样本指纹
 2. 从 .pt 文件读取 normalized pos 计算 pos_fingerprint（与运行时完全一致）
 3. 去重：只有真正新的 pos_fingerprint 才需要计算导联场
 4. 从 ProcessedData 的 electrodes.tsv 读取米制坐标 + 通道名（用于 MNE 前向计算）
@@ -43,14 +43,16 @@ Scheme B 设计要点：
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import sys
 import time
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -79,6 +81,13 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+def parse_path_list_arg(raw: str) -> Tuple[str, ...]:
+    """解析逗号分隔路径参数。"""
+    if not raw.strip():
+        return ()
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
 # ============================================================================
@@ -149,6 +158,177 @@ def compute_fingerprint_from_pt(pt_path: str) -> Optional[str]:
         return None
 
 
+def build_fingerprint_group_key(meta: Dict[str, Any]) -> str:
+    """
+    为目录级指纹复用构造稳定分组键。
+
+    默认按 (dataset, channels, parent_dir) 分组，避免不同数据集或不同通道数下
+    恰好同名目录被错误合并。
+    """
+    pt_path = str(meta["path"])
+    parent_dir = str(Path(pt_path).parent)
+    dataset_name = str(meta.get("dataset", "unknown"))
+    n_channels = int(meta.get("channels", 0))
+    return f"{dataset_name}|{n_channels}|{parent_dir}"
+
+
+def select_group_validation_indices(
+    group_key: str,
+    sample_paths: List[str],
+    random_checks: int = 2,
+) -> List[int]:
+    """
+    选择目录级轻量校验样本下标。
+
+    规则：
+    - 始终包含第 1 个和最后 1 个样本
+    - 在中间样本中再确定性随机抽取 2 个
+    - 若中间样本不足 2 个，则全部纳入
+    """
+    if not sample_paths:
+        return []
+
+    sample_count = len(sample_paths)
+    if sample_count == 1:
+        return [0]
+
+    selected = {0, sample_count - 1}
+    middle_indices = list(range(1, sample_count - 1))
+    if not middle_indices:
+        return sorted(selected)
+
+    if len(middle_indices) <= random_checks:
+        selected.update(middle_indices)
+        return sorted(selected)
+
+    seed = int.from_bytes(hashlib.sha256(group_key.encode("utf-8")).digest()[:8], "big")
+    rng = np.random.default_rng(seed)
+    random_middle = rng.choice(middle_indices, size=random_checks, replace=False)
+    selected.update(int(index) for index in random_middle.tolist())
+    return sorted(selected)
+
+
+def compute_fingerprint_group_task(
+    group_key: str,
+    sample_paths: List[str],
+    small_group_threshold: int = 4,
+    random_checks: int = 2,
+) -> Dict[str, Any]:
+    """
+    对单个目录组执行指纹计算与轻量校验。
+
+    返回:
+        {
+            "mode": "broadcast" | "per_sample",
+            "broadcast_fp": Optional[str],
+            "sample_fingerprints": List[(path, fp)],
+            "validated_count": int,
+            "group_size": int,
+            "fallback_reason": str,
+        }
+    """
+    ordered_paths = sorted(str(path) for path in sample_paths)
+    group_size = len(ordered_paths)
+
+    if group_size <= small_group_threshold:
+        return {
+            "mode": "per_sample",
+            "broadcast_fp": None,
+            "sample_fingerprints": [
+                (path, compute_fingerprint_from_pt(path))
+                for path in ordered_paths
+            ],
+            "validated_count": group_size,
+            "group_size": group_size,
+            "fallback_reason": "small_group",
+        }
+
+    validation_indices = select_group_validation_indices(
+        group_key=group_key,
+        sample_paths=ordered_paths,
+        random_checks=random_checks,
+    )
+    checked_fingerprints: Dict[str, Optional[str]] = {}
+    baseline_fp: Optional[str] = None
+    fallback_reason: Optional[str] = None
+
+    for index in validation_indices:
+        path = ordered_paths[index]
+        fp = compute_fingerprint_from_pt(path)
+        checked_fingerprints[path] = fp
+
+        if fp is None:
+            fallback_reason = "validation_failed"
+            break
+        if baseline_fp is None:
+            baseline_fp = fp
+        elif fp != baseline_fp:
+            fallback_reason = "validation_mismatch"
+            break
+
+    if fallback_reason is None and baseline_fp is not None:
+        return {
+            "mode": "broadcast",
+            "broadcast_fp": baseline_fp,
+            "sample_fingerprints": [],
+            "validated_count": len(validation_indices),
+            "group_size": group_size,
+            "fallback_reason": "",
+        }
+
+    sample_fingerprints: List[Tuple[str, Optional[str]]] = []
+    for path in ordered_paths:
+        fp = checked_fingerprints.get(path)
+        if fp is None:
+            fp = compute_fingerprint_from_pt(path)
+        sample_fingerprints.append((path, fp))
+
+    return {
+        "mode": "per_sample",
+        "broadcast_fp": None,
+        "sample_fingerprints": sample_fingerprints,
+        "validated_count": len(validation_indices),
+        "group_size": group_size,
+        "fallback_reason": fallback_reason or "unknown",
+    }
+
+
+def register_fingerprint_record(
+    path_to_fingerprint: Dict[str, str],
+    unique_fingerprints: Dict[str, Dict[str, Any]],
+    pt_path: str,
+    fingerprint: Optional[str],
+    dataset_name: str,
+    n_channels: int,
+    max_example_candidates: int,
+) -> bool:
+    """
+    记录单个样本的指纹映射，并更新唯一指纹摘要。
+
+    返回:
+        是否成功记录（False 表示 fingerprint 无效）。
+    """
+    if fingerprint in (None, "", "unknown"):
+        return False
+
+    fp = str(fingerprint)
+    path_to_fingerprint[pt_path] = fp
+    if fp not in unique_fingerprints:
+        unique_fingerprints[fp] = {
+            "datasets": {dataset_name},
+            "channels": n_channels,
+            "example_candidates": [(pt_path, dataset_name)],
+        }
+        return True
+
+    unique_fingerprints[fp]["datasets"].add(dataset_name)
+    candidates = unique_fingerprints[fp]["example_candidates"]
+    existing_datasets = {ds for _, ds in candidates}
+    if dataset_name not in existing_datasets and len(candidates) < max_example_candidates:
+        candidates.append((pt_path, dataset_name))
+    return True
+
+
 def scan_and_fingerprint(
     penci_data_dir: str,
     max_workers: int = 16,
@@ -162,10 +342,10 @@ def scan_and_fingerprint(
 
     增量策略：
     - 已有 fingerprint 字段的样本直接零 I/O 复用
-    - 仅对缺失 fingerprint 的样本并行计算（ProcessPoolExecutor）
-    - 新增 1 万样本时，只计算 1 万次而非全量 171 万次
-
-    对每个需要计算的样本读取 .pt 文件提取 pos[:,:3] 计算精确指纹，不做采样近似。
+    - 对缺失 fingerprint 的样本按 (dataset, channels, parent_dir) 分组
+    - 默认每组仅抽查 4 个样本（首/尾 + 中间随机 2 个）做轻量校验
+    - 小目录（<= 4 个样本）直接逐样本计算
+    - 若抽查发现不一致或读取失败，则该目录回退为逐样本计算
 
     参数:
         penci_data_dir: PENCIData 根目录
@@ -197,8 +377,10 @@ def scan_and_fingerprint(
     # 增量策略：已有 fingerprint 字段的样本直接复用，仅对缺失的样本并行计算
     path_to_fingerprint: Dict[str, str] = {}
     unique_fingerprints: Dict[str, Dict[str, Any]] = {}
-    need_compute: List[Tuple[int, str]] = []  # (index, pt_path)
+    need_compute_groups: Dict[str, List[Tuple[int, str, str, int]]] = defaultdict(list)
     MAX_EXAMPLE_CANDIDATES = 5  # 每个 fingerprint 最多保存的候选数
+    SMALL_GROUP_THRESHOLD = 4
+    RANDOM_CHECKS = 2
 
     for idx, meta in enumerate(all_metadata):
         fp = meta.get("fingerprint")
@@ -208,96 +390,170 @@ def scan_and_fingerprint(
 
         if fp and fp not in (None, "", "unknown"):
             # 已有有效指纹 → 零 I/O 复用
-            path_to_fingerprint[pt_path] = fp
-            if fp not in unique_fingerprints:
-                unique_fingerprints[fp] = {
-                    "datasets": {dataset_name},
-                    "channels": n_channels,
-                    "example_candidates": [(pt_path, dataset_name)],
-                }
-            else:
-                unique_fingerprints[fp]["datasets"].add(dataset_name)
-                # 优先收集不同 dataset 的候选，增加 fallback 多样性
-                candidates = unique_fingerprints[fp]["example_candidates"]
-                existing_datasets = {ds for _, ds in candidates}
-                if (dataset_name not in existing_datasets
-                        and len(candidates) < MAX_EXAMPLE_CANDIDATES):
-                    candidates.append((pt_path, dataset_name))
+            register_fingerprint_record(
+                path_to_fingerprint=path_to_fingerprint,
+                unique_fingerprints=unique_fingerprints,
+                pt_path=pt_path,
+                fingerprint=fp,
+                dataset_name=dataset_name,
+                n_channels=n_channels,
+                max_example_candidates=MAX_EXAMPLE_CANDIDATES,
+            )
         else:
             # 缺失指纹 → 需要计算
-            need_compute.append((idx, pt_path))
+            group_key = build_fingerprint_group_key(meta)
+            need_compute_groups[group_key].append(
+                (idx, pt_path, str(dataset_name), int(n_channels))
+            )
 
-    cached_count = len(all_metadata) - len(need_compute)
+    total_need_compute = sum(len(items) for items in need_compute_groups.values())
+    cached_count = len(all_metadata) - total_need_compute
     logger.info(
         f"增量检测: {cached_count} 个样本已有指纹（零 I/O 复用），"
-        f"{len(need_compute)} 个样本需要计算"
+        f"{total_need_compute} 个样本需要计算"
     )
 
-    if not need_compute:
+    if not need_compute_groups:
         logger.info(
             f"\n扫描完成: {len(unique_fingerprints)} 个唯一 pos_fingerprint，"
             f"{len(path_to_fingerprint)} 个样本已标记（全部来自缓存）"
         )
         return unique_fingerprints, path_to_fingerprint, all_metadata
 
-    # 仅对缺失指纹的样本并行计算
-    logger.info(f"并行计算 {len(need_compute)} 个样本的指纹（{max_workers} 个进程）...")
+    total_groups = len(need_compute_groups)
+    small_group_count = sum(
+        1 for items in need_compute_groups.values()
+        if len(items) <= SMALL_GROUP_THRESHOLD
+    )
+    logger.info(
+        "目录复用模式: %d 个待计算样本归并为 %d 个目录组 "
+        "(小目录 %d, 抽查规则=首尾+中间随机%d个)",
+        total_need_compute,
+        total_groups,
+        small_group_count,
+        RANDOM_CHECKS,
+    )
+    logger.info("并行计算目录组指纹（%d 个进程）...", max_workers)
+
     failed_count = 0
+    fallback_groups = 0
+    fallback_reason_counts: Dict[str, int] = defaultdict(int)
+    broadcast_groups = 0
+    covered_samples = 0
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # 提交任务：future → (idx, pt_path)
-        future_to_task = {
-            executor.submit(compute_fingerprint_from_pt, pt_path): (idx, pt_path)
-            for idx, pt_path in need_compute
-        }
+        grouped_items = [
+            (group_key, sorted(items, key=lambda item: item[1]))
+            for group_key, items in sorted(need_compute_groups.items(), key=lambda item: item[0])
+        ]
+        future_to_task: Dict[Any, Tuple[str, List[Tuple[int, str, str, int]]]] = {}
+        next_task_idx = 0
+        max_inflight = max(max_workers * 4, 1)
+        completed_groups = 0
+        log_interval = max(total_groups // 20, 1)  # 每 5% 打印一次
 
-        # 进度日志
-        total = len(future_to_task)
-        done_count = 0
-        log_interval = max(total // 20, 1)  # 每 5% 打印一次
-
-        for future in as_completed(future_to_task):
-            idx, pt_path = future_to_task[future]
-            meta = all_metadata[idx]
-            dataset_name = meta.get("dataset", "unknown")
-            n_channels = meta.get("channels", 0)
-
-            try:
-                fp = future.result()
-            except Exception as e:
-                logger.warning(f"样本 {pt_path} 指纹计算异常: {e}")
-                fp = None
-
-            if fp is None:
-                failed_count += 1
-            else:
-                path_to_fingerprint[pt_path] = fp
-                if fp not in unique_fingerprints:
-                    unique_fingerprints[fp] = {
-                        "datasets": {dataset_name},
-                        "channels": n_channels,
-                        "example_candidates": [(pt_path, dataset_name)],
-                    }
-                else:
-                    unique_fingerprints[fp]["datasets"].add(dataset_name)
-                    # 优先收集不同 dataset 的候选
-                    candidates = unique_fingerprints[fp]["example_candidates"]
-                    existing_datasets = {ds for _, ds in candidates}
-                    if (dataset_name not in existing_datasets
-                            and len(candidates) < MAX_EXAMPLE_CANDIDATES):
-                        candidates.append((pt_path, dataset_name))
-
-            done_count += 1
-            if done_count % log_interval == 0 or done_count == total:
-                logger.info(
-                    f"  进度: {done_count}/{total} "
-                    f"({done_count * 100 // total}%), "
-                    f"唯一指纹数: {len(unique_fingerprints)}, "
-                    f"失败: {failed_count}"
+        def submit_until_full() -> None:
+            nonlocal next_task_idx
+            while next_task_idx < len(grouped_items) and len(future_to_task) < max_inflight:
+                group_key, group_items = grouped_items[next_task_idx]
+                sample_paths = [pt_path for _, pt_path, _, _ in group_items]
+                future = executor.submit(
+                    compute_fingerprint_group_task,
+                    group_key,
+                    sample_paths,
+                    SMALL_GROUP_THRESHOLD,
+                    RANDOM_CHECKS,
                 )
+                future_to_task[future] = (group_key, group_items)
+                next_task_idx += 1
+
+        submit_until_full()
+
+        while future_to_task:
+            done_futures, _ = wait(
+                list(future_to_task.keys()),
+                return_when=FIRST_COMPLETED,
+            )
+
+            for future in done_futures:
+                group_key, group_items = future_to_task.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    logger.warning("目录组 %s 指纹计算异常: %s", group_key, exc)
+                    result = {
+                        "mode": "per_sample",
+                        "broadcast_fp": None,
+                        "sample_fingerprints": [
+                            (pt_path, None) for _, pt_path, _, _ in group_items
+                        ],
+                        "validated_count": 0,
+                        "group_size": len(group_items),
+                        "fallback_reason": "group_exception",
+                    }
+
+                if result["mode"] == "broadcast":
+                    broadcast_groups += 1
+                    fp = result["broadcast_fp"]
+                    for _, pt_path, dataset_name, n_channels in group_items:
+                        ok = register_fingerprint_record(
+                            path_to_fingerprint=path_to_fingerprint,
+                            unique_fingerprints=unique_fingerprints,
+                            pt_path=pt_path,
+                            fingerprint=fp,
+                            dataset_name=dataset_name,
+                            n_channels=n_channels,
+                            max_example_candidates=MAX_EXAMPLE_CANDIDATES,
+                        )
+                        if not ok:
+                            failed_count += 1
+                else:
+                    fallback_groups += 1
+                    reason = str(result.get("fallback_reason") or "unknown")
+                    fallback_reason_counts[reason] += 1
+                    fingerprint_by_path = {
+                        path: fp
+                        for path, fp in result.get("sample_fingerprints", [])
+                    }
+                    for _, pt_path, dataset_name, n_channels in group_items:
+                        ok = register_fingerprint_record(
+                            path_to_fingerprint=path_to_fingerprint,
+                            unique_fingerprints=unique_fingerprints,
+                            pt_path=pt_path,
+                            fingerprint=fingerprint_by_path.get(pt_path),
+                            dataset_name=dataset_name,
+                            n_channels=n_channels,
+                            max_example_candidates=MAX_EXAMPLE_CANDIDATES,
+                        )
+                        if not ok:
+                            failed_count += 1
+
+                covered_samples += len(group_items)
+                completed_groups += 1
+                if completed_groups % log_interval == 0 or completed_groups == total_groups:
+                    logger.info(
+                        "  进度: 目录组 %d/%d (%d%%), 覆盖样本 %d/%d, "
+                        "唯一指纹数: %d, 广播组: %d, 回退组: %d, 失败样本: %d",
+                        completed_groups,
+                        total_groups,
+                        completed_groups * 100 // total_groups,
+                        covered_samples,
+                        total_need_compute,
+                        len(unique_fingerprints),
+                        broadcast_groups,
+                        fallback_groups,
+                        failed_count,
+                    )
+
+            submit_until_full()
 
     if failed_count > 0:
         logger.warning(f"共 {failed_count} 个样本指纹计算失败")
+    if fallback_groups > 0:
+        logger.info(
+            "目录回退统计: %s",
+            dict(sorted(fallback_reason_counts.items())),
+        )
 
     logger.info(
         f"\n扫描完成: {len(unique_fingerprints)} 个唯一 pos_fingerprint，"
@@ -543,6 +799,225 @@ def update_metadata_fingerprints(
     return updated_count
 
 
+def discover_template_meta_files(template_roots: Tuple[str, ...]) -> List[Path]:
+    """递归发现所有 template_meta.json 文件。"""
+    meta_paths: List[Path] = []
+    seen: Set[Path] = set()
+    for root_str in template_roots:
+        root = Path(root_str)
+        if not root.exists():
+            logger.warning("模板根目录不存在，跳过: %s", root)
+            continue
+        for meta_path in sorted(root.rglob("template_meta.json")):
+            if meta_path not in seen:
+                seen.add(meta_path)
+                meta_paths.append(meta_path)
+    return meta_paths
+
+
+def load_template_configs(
+    template_roots: Tuple[str, ...],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    从外部模板库加载唯一物理模板配置（按 full_fingerprint 去重）。
+    """
+    template_configs: Dict[str, Dict[str, Any]] = {}
+    meta_paths = discover_template_meta_files(template_roots)
+    logger.info("发现 %d 个 template_meta.json", len(meta_paths))
+
+    for meta_path in meta_paths:
+        try:
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+        except Exception as exc:
+            logger.warning("读取模板元数据失败，跳过 %s: %s", meta_path, exc)
+            continue
+
+        channel_names = meta.get("channel_names")
+        channel_positions = meta.get("channel_positions_m")
+        if not channel_names or channel_positions is None:
+            logger.warning("模板缺少 channel_names / channel_positions_m，跳过: %s", meta_path)
+            continue
+
+        positions_np = np.asarray(channel_positions, dtype=np.float64)
+        n_channels = int(meta.get("n_channels", -1))
+        if positions_np.ndim != 2 or positions_np.shape != (n_channels, 3):
+            logger.warning(
+                "模板坐标形状无效，跳过: %s (shape=%s, n_channels=%s)",
+                meta_path,
+                positions_np.shape,
+                n_channels,
+            )
+            continue
+
+        full_fp = _compute_channel_hash(channel_names, positions_np)
+        if full_fp in template_configs:
+            template_configs[full_fp].setdefault("duplicate_meta_paths", []).append(str(meta_path))
+            continue
+
+        template_configs[full_fp] = {
+            "dataset_name": str(meta.get("dataset_name", meta_path.parent.name)),
+            "channel_names": list(channel_names),
+            "channel_positions": positions_np,
+            "meta_path": str(meta_path),
+            "n_channels": n_channels,
+        }
+
+    logger.info("模板库唯一物理模板数: %d", len(template_configs))
+    return template_configs
+
+
+def copy_or_compute_leadfield(
+    full_fp: str,
+    existing_cache_path: Optional[str],
+    channel_names: List[str],
+    channel_positions: np.ndarray,
+    subjects_dir: str,
+    cache_dir: str,
+) -> Optional[str]:
+    """
+    优先复制已有缓存；若不存在则重新计算。
+    """
+    dst_path = Path(cache_dir) / f"{full_fp}.pt"
+    if dst_path.exists():
+        logger.info("  目标缓存已存在: %s", dst_path)
+        return str(dst_path)
+
+    if existing_cache_path:
+        src_path = Path(existing_cache_path)
+        if src_path.exists():
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+            logger.info("  已复制已有缓存: %s -> %s", src_path, dst_path)
+            return str(dst_path)
+        logger.warning("  已有缓存路径不存在，改为重新计算: %s", src_path)
+
+    return compute_leadfield_for_config(
+        channel_names=channel_names,
+        channel_positions=channel_positions,
+        subjects_dir=subjects_dir,
+        cache_dir=cache_dir,
+    )
+
+
+def build_registry_from_seed_archive(
+    seed_archive_path: str,
+    cache_dir: str,
+    subjects_dir: str,
+) -> Tuple[ElectrodeConfigRegistry, Set[str], int, int]:
+    """
+    从已有 archive 构建一个按 full_fingerprint 去重的新 registry。
+    """
+    logger.info("从 seed archive 构建仿真 registry: %s", seed_archive_path)
+    archive = torch.load(seed_archive_path, map_location="cpu", weights_only=False)
+    configs = archive.get("configs", {})
+
+    registry = ElectrodeConfigRegistry(processed_data_dir="")
+    seen_full_fps: Set[str] = set()
+    imported_count = 0
+    copied_count = 0
+
+    for _, entry in sorted(configs.items()):
+        full_fp = str(entry.get("full_fingerprint", ""))
+        if not full_fp or full_fp in seen_full_fps:
+            continue
+
+        channel_names = entry.get("channel_names")
+        channel_positions = entry.get("channel_positions_m")
+        if not channel_names or channel_positions is None:
+            logger.warning("seed archive 条目缺少通道配置，跳过 full_fp=%s", full_fp)
+            continue
+
+        positions_np = np.asarray(channel_positions, dtype=np.float64)
+        registry.register_config(
+            channel_names=list(channel_names),
+            channel_positions=positions_np,
+            dataset_name="seed_archive",
+        )
+        seen_full_fps.add(full_fp)
+        imported_count += 1
+
+        cache_path = copy_or_compute_leadfield(
+            full_fp=full_fp,
+            existing_cache_path=entry.get("leadfield_cache_path"),
+            channel_names=list(channel_names),
+            channel_positions=positions_np,
+            subjects_dir=subjects_dir,
+            cache_dir=cache_dir,
+        )
+        if cache_path is not None:
+            copied_count += 1
+
+    logger.info(
+        "seed archive 导入完成: %d 个唯一物理模板, %d 个缓存已准备",
+        imported_count,
+        copied_count,
+    )
+    return registry, seen_full_fps, imported_count, copied_count
+
+
+def merge_templates_into_registry(
+    registry: ElectrodeConfigRegistry,
+    existing_full_fps: Set[str],
+    template_configs: Dict[str, Dict[str, Any]],
+    subjects_dir: str,
+    cache_dir: str,
+) -> Tuple[int, int, int]:
+    """
+    将外部模板库合并进 registry 并离线计算缺失导联场。
+    """
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+
+    for full_fp, entry in sorted(template_configs.items()):
+        dataset_name = entry["dataset_name"]
+        channel_names = entry["channel_names"]
+        channel_positions = entry["channel_positions"]
+        meta_path = entry["meta_path"]
+
+        logger.info(
+            "\n处理外部模板 full_fp=%s (%sch, dataset=%s)",
+            full_fp,
+            len(channel_names),
+            dataset_name,
+        )
+
+        if full_fp in existing_full_fps:
+            logger.info("  跳过：已存在于 registry 中")
+            skip_count += 1
+            continue
+
+        registry.register_config(
+            channel_names=list(channel_names),
+            channel_positions=channel_positions,
+            dataset_name=dataset_name,
+        )
+        existing_full_fps.add(full_fp)
+        logger.info("  已注册模板: %s", meta_path)
+
+        cache_path = copy_or_compute_leadfield(
+            full_fp=full_fp,
+            existing_cache_path=None,
+            channel_names=list(channel_names),
+            channel_positions=channel_positions,
+            subjects_dir=subjects_dir,
+            cache_dir=cache_dir,
+        )
+        if cache_path is not None:
+            success_count += 1
+        else:
+            fail_count += 1
+
+    logger.info(
+        "外部模板处理完成: %d 成功, %d 跳过, %d 失败",
+        success_count,
+        skip_count,
+        fail_count,
+    )
+    return success_count, skip_count, fail_count
+
+
 # ============================================================================
 # 主流程
 # ============================================================================
@@ -600,6 +1075,18 @@ def main():
         help="回写 fingerprint 到 metadata JSON 文件",
     )
     parser.add_argument(
+        "--seed_archive",
+        type=str,
+        default="",
+        help="可选：已有真实数据 archive，作为底座导入到新的 cache/archive 中",
+    )
+    parser.add_argument(
+        "--template_roots",
+        type=str,
+        default="",
+        help="可选：逗号分隔的外部模板根目录；会递归搜索 template_meta.json 并补算导联场",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="输出详细日志",
@@ -612,6 +1099,53 @@ def main():
 
     if args.archive_out is None:
         args.archive_out = os.path.join(args.cache_dir, "fingerprint_registry.pt")
+
+    template_roots = parse_path_list_arg(args.template_roots)
+
+    # === 合并模式：已有真实 archive + 外部模板库 ===
+    if args.seed_archive or template_roots:
+        if not args.subjects_dir:
+            raise RuntimeError("合并模式需要 --subjects_dir")
+
+        logger.info("=" * 60)
+        logger.info("合并模式：seed archive + 外部模板库")
+        logger.info("=" * 60)
+
+        Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
+        registry = ElectrodeConfigRegistry(processed_data_dir="")
+        existing_full_fps: Set[str] = set()
+        imported_count = 0
+        copied_count = 0
+
+        if args.seed_archive:
+            registry, existing_full_fps, imported_count, copied_count = (
+                build_registry_from_seed_archive(
+                    seed_archive_path=args.seed_archive,
+                    cache_dir=args.cache_dir,
+                    subjects_dir=args.subjects_dir,
+                )
+            )
+
+        if template_roots:
+            template_configs = load_template_configs(template_roots)
+            merge_templates_into_registry(
+                registry=registry,
+                existing_full_fps=existing_full_fps,
+                template_configs=template_configs,
+                subjects_dir=args.subjects_dir,
+                cache_dir=args.cache_dir,
+            )
+        else:
+            logger.info("未提供 template_roots，仅导入 seed archive")
+
+        save_archive(registry, args.archive_out, cache_dir=args.cache_dir)
+        logger.info(
+            "合并模式完成: %d 个唯一物理模板, cache_dir=%s, archive=%s",
+            len(existing_full_fps),
+            args.cache_dir,
+            args.archive_out,
+        )
+        return
 
     t_start = time.time()
 

@@ -190,9 +190,14 @@ class SEANetEncoder(nn.Module):
                 pad_mode=pad_mode,
             )
         ]
+
+        # 记录每个下采样阶段的输出索引与通道数，供多尺度特征导出使用
+        self.stage_output_indices: tp.Dict[int, int] = {}
+        self.stage_output_channels: tp.Dict[int, int] = {}
+        stage_factor = 1
         
         # 下采样到原始信号尺度
-        for i, ratio in enumerate(self.ratios):
+        for ratio in self.ratios:
             # 添加残差层
             for j in range(n_residual_layers):
                 model += [
@@ -228,6 +233,9 @@ class SEANetEncoder(nn.Module):
                     pad_mode=pad_mode,
                 ),
             ]
+            stage_factor *= ratio
+            self.stage_output_indices[stage_factor] = len(model) - 1
+            self.stage_output_channels[stage_factor] = mult * n_filters * 2
             mult *= 2
 
         if lstm:
@@ -254,12 +262,38 @@ class SEANetEncoder(nn.Module):
         ]
 
         self.model = nn.Sequential(*model)
+        self.stage_factors = sorted(self.stage_output_indices.keys())
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_intermediates: bool = False,
+    ) -> tp.Union[torch.Tensor, tp.Dict[str, tp.Any]]:
         """
         参数:
             x: 输入信号 (B, 1, T)
+            return_intermediates: 是否返回多尺度中间特征
         返回:
             编码特征 (B, D, T')，其中 T' = T / hop_length
         """
-        return self.model(x)
+        if not return_intermediates:
+            return self.model(x)
+
+        stage_outputs: tp.Dict[str, torch.Tensor] = {}
+        stage_by_factor: tp.Dict[int, torch.Tensor] = {}
+        current = x
+        for idx, layer in enumerate(self.model):
+            current = layer(current)
+            for factor, stage_idx in self.stage_output_indices.items():
+                if idx == stage_idx:
+                    key = f"x_{factor}x"
+                    stage_outputs[key] = current
+                    stage_by_factor[factor] = current
+
+        return {
+            "final": current,
+            "stage_outputs": stage_outputs,
+            "stage_by_factor": stage_by_factor,
+            "stage_factors": list(self.stage_factors),
+            "hop_length": int(self.hop_length),
+        }
